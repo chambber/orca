@@ -416,6 +416,216 @@ describe('markLiveCodexSessionsForRestart', () => {
   })
 })
 
+/**
+ * A restart notice blocks every keystroke in the pane it names, so raising one
+ * on a pane the switch could not have touched takes a working terminal deaf.
+ * A managed Codex account is scoped to one machine AND one runtime: a remote
+ * spawn carries a connectionId, so no CODEX_HOME is ever injected into it, and
+ * WSL selections live in their own per-distro slot.
+ */
+describe('markLiveCodexSessionsForRestart lane scoping', () => {
+  const originalWindow = (globalThis as { window?: typeof window }).window
+  const runtimeEnvironmentCall = vi.fn()
+  const runtimeEnvironmentTransportCall = vi.fn()
+
+  function seedPanes(
+    panes: { ptyId: string; worktreeId?: string; shellOverride?: string }[],
+    worktreePaths: Record<string, string> = {}
+  ): void {
+    useAppStore.setState({
+      settings: { activeRuntimeEnvironmentId: null } as never,
+      worktreesByRepo: {
+        repo1: [
+          { id: 'wt1', path: worktreePaths.wt1 ?? '/Users/dev/code/orca' },
+          ...(worktreePaths.wt2 ? [{ id: 'wt2', path: worktreePaths.wt2 }] : [])
+        ]
+      } as never,
+      tabsByWorktree: {
+        wt1: panes.map((pane, index) => ({
+          id: `tab-${index}`,
+          ptyId: pane.ptyId,
+          worktreeId: pane.worktreeId ?? 'wt1',
+          title: `orca-${index}`,
+          customTitle: null,
+          color: null,
+          sortOrder: index,
+          createdAt: 1,
+          launchAgent: 'codex' as const,
+          ...(pane.shellOverride ? { shellOverride: pane.shellOverride } : {})
+        }))
+      },
+      ptyIdsByTabId: Object.fromEntries(panes.map((pane, index) => [`tab-${index}`, [pane.ptyId]])),
+      pendingCodexPaneRestartIds: {},
+      codexRestartNoticeByPtyId: {}
+    })
+  }
+
+  beforeEach(() => {
+    clearRuntimeCompatibilityCacheForTests()
+    runtimeEnvironmentCall.mockReset()
+    runtimeEnvironmentTransportCall.mockReset()
+    runtimeEnvironmentTransportCall.mockImplementation((args: RuntimeEnvironmentCallRequest) => {
+      return createCompatibleRuntimeStatusResponseIfNeeded(args) ?? runtimeEnvironmentCall(args)
+    })
+    // Why: every pane in this block reads as a live Codex session, so any pane
+    // left uncarded was excluded by its lane and nothing else.
+    runtimeEnvironmentCall.mockResolvedValue({
+      id: 'rpc-1',
+      ok: true,
+      result: { process: { foregroundProcess: 'codex', hasChildProcesses: true } },
+      _meta: { runtimeId: 'remote-runtime' }
+    })
+    ;(globalThis as { window: typeof window }).window = {
+      ...originalWindow,
+      api: {
+        ...originalWindow?.api,
+        pty: {
+          ...originalWindow?.api?.pty,
+          inspectProcess: vi
+            .fn()
+            .mockResolvedValue({ foregroundProcess: 'codex', hasChildProcesses: true })
+        },
+        codexAccounts: {
+          ...originalWindow?.api?.codexAccounts,
+          list: vi.fn().mockResolvedValue({ accounts: [], activeAccountId: null }),
+          listStalePanes: vi.fn().mockResolvedValue([])
+        },
+        runtimeEnvironments: {
+          ...originalWindow?.api?.runtimeEnvironments,
+          call: runtimeEnvironmentTransportCall
+        }
+      }
+    } as unknown as typeof window
+  })
+
+  afterEach(() => {
+    useAppStore.setState({ settings: null as never, worktreesByRepo: {} as never })
+    if (originalWindow) {
+      ;(globalThis as { window: typeof window }).window = originalWindow
+    } else {
+      delete (globalThis as { window?: typeof window }).window
+    }
+  })
+
+  it('leaves a live remote Codex pane alone on a host switch, and never inspects it', async () => {
+    seedPanes([{ ptyId: 'remote:env-1@@term-1' }])
+
+    await markLiveCodexSessionsForRestart({
+      previousAccountLabel: ACCOUNT_A,
+      nextAccountLabel: ACCOUNT_B,
+      target: { runtime: 'host' }
+    })
+
+    expect(useAppStore.getState().codexRestartNoticeByPtyId).toEqual({})
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalled()
+  })
+
+  it('leaves a live SSH-connection Codex pane alone on a host switch', async () => {
+    seedPanes([{ ptyId: 'ssh:my-box@@pty-7' }])
+
+    await markLiveCodexSessionsForRestart({
+      previousAccountLabel: ACCOUNT_A,
+      nextAccountLabel: ACCOUNT_B,
+      target: { runtime: 'host' }
+    })
+
+    expect(useAppStore.getState().codexRestartNoticeByPtyId).toEqual({})
+    expect(window.api.pty.inspectProcess).not.toHaveBeenCalled()
+  })
+
+  it('still marks the local host pane while sparing the remote one beside it', async () => {
+    seedPanes([{ ptyId: 'pty-1' }, { ptyId: 'remote:env-1@@term-1' }])
+
+    await markLiveCodexSessionsForRestart({
+      previousAccountLabel: ACCOUNT_A,
+      nextAccountLabel: ACCOUNT_B,
+      target: { runtime: 'host' }
+    })
+
+    expect(useAppStore.getState().codexRestartNoticeByPtyId).toEqual({
+      'pty-1': { previousAccountLabel: ACCOUNT_A, nextAccountLabel: ACCOUNT_B }
+    })
+    expect(window.api.pty.inspectProcess).toHaveBeenCalledWith('pty-1')
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalled()
+  })
+
+  it('still marks a local host pane when the switch names no target at all', async () => {
+    seedPanes([{ ptyId: 'pty-1' }])
+
+    await markLiveCodexSessionsForRestart({
+      previousAccountLabel: ACCOUNT_A,
+      nextAccountLabel: ACCOUNT_B
+    })
+
+    expect(useAppStore.getState().codexRestartNoticeByPtyId).toEqual({
+      'pty-1': { previousAccountLabel: ACCOUNT_A, nextAccountLabel: ACCOUNT_B }
+    })
+  })
+
+  // Why these two: a Windows validation saw a WSL pane escape a host switch, but
+  // only because its foreground read as `wsl.exe` and failed the Codex test. Pin
+  // the lane instead — a WSL pane whose foreground IS codex must escape too.
+  it('leaves a WSL Codex pane alone on a host switch even when its foreground is codex', async () => {
+    seedPanes([{ ptyId: 'pty-wsl' }], { wt1: '\\\\wsl.localhost\\Ubuntu\\home\\dev\\orca' })
+
+    await markLiveCodexSessionsForRestart({
+      previousAccountLabel: ACCOUNT_A,
+      nextAccountLabel: ACCOUNT_B,
+      target: { runtime: 'host' }
+    })
+
+    expect(useAppStore.getState().codexRestartNoticeByPtyId).toEqual({})
+    expect(window.api.pty.inspectProcess).not.toHaveBeenCalled()
+  })
+
+  it('marks that same WSL pane when its own distro is the lane that changed', async () => {
+    seedPanes([{ ptyId: 'pty-wsl' }], { wt1: '\\\\wsl.localhost\\Ubuntu\\home\\dev\\orca' })
+
+    await markLiveCodexSessionsForRestart({
+      previousAccountLabel: ACCOUNT_A,
+      nextAccountLabel: ACCOUNT_B,
+      target: { runtime: 'wsl', wslDistro: 'Ubuntu' }
+    })
+
+    expect(useAppStore.getState().codexRestartNoticeByPtyId).toEqual({
+      'pty-wsl': { previousAccountLabel: ACCOUNT_A, nextAccountLabel: ACCOUNT_B }
+    })
+  })
+
+  it('keeps one distro switch off another distro pane', async () => {
+    seedPanes([{ ptyId: 'pty-wsl' }], { wt1: '\\\\wsl.localhost\\Ubuntu\\home\\dev\\orca' })
+
+    await markLiveCodexSessionsForRestart({
+      previousAccountLabel: ACCOUNT_A,
+      nextAccountLabel: ACCOUNT_B,
+      target: { runtime: 'wsl', wslDistro: 'Debian' }
+    })
+
+    expect(useAppStore.getState().codexRestartNoticeByPtyId).toEqual({})
+  })
+
+  it('leaves the local host pane alone when the switch was made on a runtime environment', async () => {
+    seedPanes([{ ptyId: 'pty-1' }, { ptyId: 'remote:env-1@@term-1' }])
+    useAppStore.setState({ settings: { activeRuntimeEnvironmentId: 'env-1' } as never })
+
+    await markLiveCodexSessionsForRestart({
+      previousAccountLabel: ACCOUNT_A,
+      nextAccountLabel: ACCOUNT_B,
+      target: { runtime: 'host' }
+    })
+
+    // Why: that mutation was RPC'd to env-1's own roster, so env-1's panes are
+    // the stale ones and the local shell is untouched — the mirror of the bug.
+    expect(useAppStore.getState().codexRestartNoticeByPtyId).toEqual({
+      'remote:env-1@@term-1': {
+        previousAccountLabel: ACCOUNT_A,
+        nextAccountLabel: ACCOUNT_B
+      }
+    })
+    expect(window.api.pty.inspectProcess).not.toHaveBeenCalled()
+  })
+})
+
 describe('markRestoredStaleCodexSessionsForRestart', () => {
   const originalWindow = (globalThis as { window?: typeof window }).window
 

@@ -1466,7 +1466,10 @@ export function CodexSwitcherMenu({
       if (previousActiveAccountId !== nextActiveAccountId) {
         await markLiveCodexSessionsForRestart({
           previousAccountLabel: getCodexAccountLabel(accountState, previousActiveAccountId),
-          nextAccountLabel: getCodexAccountLabel(next, nextActiveAccountId)
+          nextAccountLabel: getCodexAccountLabel(next, nextActiveAccountId),
+          // Why: the mutation wrote this row's slot only, so panes on any other
+          // lane still launch under the account they already had.
+          target
         })
         // Why: collapse to the summary row (not close) so the follow-up "restart open tabs" prompt appears in the same flow.
         if (mountedRef.current) {
