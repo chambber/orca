@@ -21,11 +21,11 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 24
           cache: 'pnpm'
 
       - name: Install Dependencies
-        run: pnpm install --ignore-scripts
+        run: pnpm config set ignore-scripts true && pnpm install --no-frozen-lockfile
 
       - name: Ensure Native Runtime
         run: node config/scripts/ensure-native-runtime.mjs --runtime=electron
