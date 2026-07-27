@@ -34,8 +34,10 @@ jobs:
         run: pnpm run build:desktop
 
       - name: Build Unsigned Windows Installer
-        # Usa o comando subjacente do build:win do package.json, mas forçando publicação nula e sem certificado
-        run: pnpm exec electron-builder --config config/electron-builder.config.cjs --win --publish never -c.win.certificateSubjectName=null -c.win.certificateSha1=null
+        env:
+          CSC_LINK: ''
+          CSC_KEY_PASSWORD: ''
+        run: pnpm exec electron-builder --config config/electron-builder.config.cjs --win --publish never -c.win.certificateFile= -c.win.certificateSubjectName= -c.win.certificateSha1=
 
       - name: Upload Installer Artifact
         uses: actions/upload-artifact@v4
