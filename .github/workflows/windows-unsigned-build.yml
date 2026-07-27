@@ -37,7 +37,7 @@ jobs:
         env:
           CSC_LINK: ''
           CSC_KEY_PASSWORD: ''
-        run: pnpm exec electron-builder --config config/electron-builder.config.cjs --win --publish never -c.win.certificateFile= -c.win.certificateSubjectName= -c.win.certificateSha1=
+        run: pnpm exec electron-builder --config config/electron-builder.config.cjs --win --publish never
 
       - name: Upload Installer Artifact
         uses: actions/upload-artifact@v4
