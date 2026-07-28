@@ -511,6 +511,10 @@ export type Worktree = {
   /** Path-derived worktree ids this worktree had before folder renames. */
   priorWorktreeIds?: string[]
   workspaceStatus?: WorkspaceStatus
+  /** Claude managed account this worktree is pinned to, resolved fresh at each
+   *  PTY spawn into a per-terminal CLAUDE_CONFIG_DIR. null/undefined = inherit
+   *  the global host selection (today's behavior). */
+  claudeAccountId?: string | null
   diffComments?: DiffComment[]
   mobileDiffReview?: MobileDiffReviewState
   automationProvenance?: AutomationWorkspaceProvenance
@@ -616,6 +620,8 @@ export type WorktreeMeta = {
   orcaCreationWorkspaceLayout?: OrcaWorkspaceLayout
   /** User-assigned workspace board status for manual sidebar organization. */
   workspaceStatus?: WorkspaceStatus
+  /** See {@link Worktree.claudeAccountId}. Persisted to orca-data.json. */
+  claudeAccountId?: string | null
   diffComments?: DiffComment[]
   /** Path-derived worktree ids this worktree had before its folder was renamed
    *  on disk (the id embeds the path). Lets the daemon's session GC and registry
@@ -2098,6 +2104,9 @@ export type CreateWorktreeArgs = {
   linkedGiteaPR?: number | null
   pushTarget?: GitPushTarget
   workspaceStatus?: WorkspaceStatus
+  /** Claude managed account to pin this worktree to at creation. Omitted/null =
+   *  inherit the global host selection. See {@link Worktree.claudeAccountId}. */
+  claudeAccountId?: string | null
   manualOrder?: number
   /** Parent workspace for in-app creates launched from a folder workspace. */
   parentWorkspace?: WorkspaceKey
@@ -2333,6 +2342,16 @@ export type ClaudeManagedAccountSummary = {
   createdAt: number
   updatedAt: number
   lastAuthenticatedAt: number
+}
+
+export type ClaudeLivePtyAccountBinding = {
+  sessionId: string
+  accountId: string
+}
+
+export type ClaudeLiveSharedPtyAccountBinding = {
+  sessionId: string
+  accountId: string | null
 }
 
 export type ClaudeRateLimitAccountsState = {
@@ -3584,6 +3603,12 @@ export type PersistedState = {
    *  live-PTY gate on startup so an early OAuth refresh cannot rotate the
    *  single-use refresh token out from under a still-running daemon CLI. */
   claudeLivePtySessionIds?: string[]
+  /** Launch-account ownership for shared Claude daemon sessions. A null
+   * account is a conservative legacy/system-default identity. */
+  claudeLiveSharedPtyAccountBindings?: ClaudeLiveSharedPtyAccountBinding[]
+  /** Account ownership for live injected Claude daemon sessions. This keeps
+   *  account-specific auth immutable across app restarts until the CLI exits. */
+  claudeLivePtyAccountBindings?: ClaudeLivePtyAccountBinding[]
   migrationUnsupportedPtyEntries: MigrationUnsupportedPtyEntry[]
   legacyPaneKeyAliasEntries: LegacyPaneKeyAliasEntry[]
   automations: Automation[]

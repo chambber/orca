@@ -105,6 +105,7 @@ describe('worktree RPC methods', () => {
         displayName: 'Feature title',
         telemetrySource: 'sidebar',
         workspaceStatus: 'in-review',
+        claudeAccountId: 'account-a',
         manualOrder: 123_456,
         linkedIssue: 123,
         linkedPR: 456,
@@ -135,6 +136,7 @@ describe('worktree RPC methods', () => {
       displayName: 'Feature title',
       telemetrySource: 'sidebar',
       workspaceStatus: 'in-review',
+      claudeAccountId: 'account-a',
       manualOrder: 123_456,
       sparseCheckout: { directories: ['src'], presetId: 'preset-1' },
       pushTarget: { remoteName: 'fork', branchName: 'feature' },
@@ -756,6 +758,37 @@ describe('worktree RPC methods', () => {
         pushTarget: null
       })
     )
+  })
+
+  it('forwards account pins and validated metadata batches', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      updateManagedWorktreeMeta: vi.fn().mockResolvedValue({ id: 'wt-1' }),
+      updateManagedWorktreesMeta: vi.fn().mockResolvedValue({ updated: 2 })
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: WORKTREE_METHODS })
+
+    await dispatcher.dispatch(
+      makeRequest('worktree.set', { worktree: 'id:wt-1', claudeAccountId: null })
+    )
+    const response = await dispatcher.dispatch(
+      makeRequest('worktree.setBatch', {
+        updates: [
+          { worktree: 'id:wt-1', claudeAccountId: 'account-a' },
+          { worktree: 'id:wt-2', claudeAccountId: null }
+        ]
+      })
+    )
+
+    expect(runtime.updateManagedWorktreeMeta).toHaveBeenCalledWith(
+      'id:wt-1',
+      expect.objectContaining({ claudeAccountId: null })
+    )
+    expect(runtime.updateManagedWorktreesMeta).toHaveBeenCalledWith([
+      { worktreeSelector: 'id:wt-1', updates: { claudeAccountId: 'account-a' } },
+      { worktreeSelector: 'id:wt-2', updates: { claudeAccountId: null } }
+    ])
+    expect(response).toMatchObject({ ok: true, result: { updated: 2 } })
   })
 
   it('rejects worktree.set when both parent and no-parent are supplied', async () => {

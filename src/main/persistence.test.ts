@@ -4,6 +4,7 @@ reviewed against the full storage contract instead of being scattered. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   writeFileSync,
+  chmodSync,
   readFileSync,
   rmSync,
   mkdtempSync,
@@ -9074,7 +9075,7 @@ describe('Store', () => {
     it('persists added ids across reloads and removes them durably', async () => {
       const store = await createStore()
 
-      store.addClaudeLivePtySessionId('claude-session-1')
+      store.addClaudeLivePtySessionId('claude-session-1', 'account-a')
       store.addClaudeLivePtySessionId('claude-session-2')
       store.addClaudeLivePtySessionId('claude-session-1')
 
@@ -9085,23 +9086,40 @@ describe('Store', () => {
         'claude-session-1',
         'claude-session-2'
       ])
+      expect(reloaded.getClaudeLiveSharedPtyAccountBindings()).toEqual([
+        { sessionId: 'claude-session-1', accountId: 'account-a' },
+        { sessionId: 'claude-session-2', accountId: null }
+      ])
 
       reloaded.removeClaudeLivePtySessionId('claude-session-1')
       reloaded.flush()
 
       const reloadedAgain = await createStore()
       expect(reloadedAgain.getClaudeLivePtySessionIds()).toEqual(['claude-session-2'])
+      expect(reloadedAgain.getClaudeLiveSharedPtyAccountBindings()).toEqual([
+        { sessionId: 'claude-session-2', accountId: null }
+      ])
     })
 
     it('drops malformed persisted entries on load', async () => {
       writeDataFile({
         schemaVersion: 1,
-        claudeLivePtySessionIds: ['valid-id', '', 42, null, 'valid-id', 'x'.repeat(513)]
+        claudeLivePtySessionIds: ['valid-id', '', 42, null, 'valid-id', 'x'.repeat(513)],
+        claudeLiveSharedPtyAccountBindings: [
+          { sessionId: 'valid-id', accountId: 'account-a' },
+          { sessionId: '', accountId: 'bad' },
+          { sessionId: 'unknown-id', accountId: null },
+          { sessionId: 'bad-account', accountId: '' }
+        ]
       })
 
       const store = await createStore()
 
       expect(store.getClaudeLivePtySessionIds()).toEqual(['valid-id'])
+      expect(store.getClaudeLiveSharedPtyAccountBindings()).toEqual([
+        { sessionId: 'valid-id', accountId: 'account-a' },
+        { sessionId: 'unknown-id', accountId: null }
+      ])
     })
 
     it('keeps the newest ids when an oversized persisted list is loaded', async () => {
@@ -9128,6 +9146,234 @@ describe('Store', () => {
       expect(ids).toHaveLength(200)
       expect(ids[0]).toBe('claude-session-5')
       expect(ids[199]).toBe('claude-session-204')
+    })
+
+    it('fails closed and rearms unrelated state after a shared-ownership write failure', async () => {
+      const store = await createStore()
+      store.updateSettings({ terminalFontSize: 19 })
+      chmodSync(testState.dir, 0o500)
+      try {
+        expect(() => store.addClaudeLivePtySessionId('claude-session-1', 'account-a')).toThrow()
+        expect(store.getClaudeLivePtySessionIds()).toEqual([])
+        expect(store.getClaudeLiveSharedPtyAccountBindings()).toEqual([])
+        expect(
+          (store as unknown as { writeTimer: ReturnType<typeof setTimeout> | null }).writeTimer
+        ).not.toBeNull()
+      } finally {
+        chmodSync(testState.dir, 0o700)
+      }
+
+      store.flush()
+      expect((await createStore()).getSettings().terminalFontSize).toBe(19)
+    })
+  })
+
+  describe('claudeLivePtyAccountBindings', () => {
+    it('persists account ownership and removes it by session id', async () => {
+      const store = await createStore()
+      const flush = vi.spyOn(store as unknown as { flushOrThrow(): void }, 'flushOrThrow')
+      store.addClaudeLivePtyAccountBinding('claude-session-1', 'account-a')
+      store.addClaudeLivePtyAccountBinding('claude-session-1', 'account-a')
+
+      expect(flush).toHaveBeenCalledTimes(1)
+
+      const reloaded = await createStore()
+      expect(reloaded.getClaudeLivePtyAccountBindings()).toEqual([
+        { sessionId: 'claude-session-1', accountId: 'account-a' }
+      ])
+
+      reloaded.removeClaudeLivePtyAccountBinding('claude-session-1')
+      reloaded.flush()
+      expect((await createStore()).getClaudeLivePtyAccountBindings()).toEqual([])
+    })
+
+    it('fails closed and rolls back memory when durable binding persistence fails', async () => {
+      const store = await createStore()
+      vi.spyOn(store as unknown as { flushOrThrow(): void }, 'flushOrThrow').mockImplementationOnce(
+        () => {
+          throw new Error('disk full')
+        }
+      )
+
+      expect(() => store.addClaudeLivePtyAccountBinding('claude-session-1', 'account-a')).toThrow(
+        'disk full'
+      )
+      expect(store.getClaudeLivePtyAccountBindings()).toEqual([])
+    })
+
+    it('drops malformed bindings and keeps the newest value per session', async () => {
+      writeDataFile({
+        schemaVersion: 1,
+        claudeLivePtyAccountBindings: [
+          { sessionId: 'same', accountId: 'old' },
+          null,
+          { sessionId: '', accountId: 'invalid' },
+          { sessionId: 'same', accountId: 'new' }
+        ]
+      })
+
+      expect((await createStore()).getClaudeLivePtyAccountBindings()).toEqual([
+        { sessionId: 'same', accountId: 'new' }
+      ])
+    })
+
+    it('coalesces workspace and injected-account binding into one durable flush', async () => {
+      const store = await createStore()
+      const flush = vi.spyOn(store as unknown as { flushOrThrow(): void }, 'flushOrThrow')
+
+      expect(
+        store.persistPtyBinding({
+          worktreeId: 'repo-1::/tmp/worktree',
+          tabId: 'tab-1',
+          leafId: TEST_LEAF_1,
+          ptyId: 'claude-session-1',
+          claudeAccountId: 'account-a'
+        })
+      ).toBe(true)
+      store.addClaudeLivePtyAccountBinding('claude-session-1', 'account-a')
+
+      expect(flush).toHaveBeenCalledTimes(1)
+      expect(store.getClaudeLivePtyAccountBindings()).toEqual([
+        { sessionId: 'claude-session-1', accountId: 'account-a' }
+      ])
+    })
+
+    it('coalesces workspace and shared-account ownership into one durable flush', async () => {
+      const store = await createStore()
+      const flush = vi.spyOn(store as unknown as { flushOrThrow(): void }, 'flushOrThrow')
+
+      expect(
+        store.persistPtyBinding({
+          worktreeId: 'repo-1::/tmp/worktree',
+          tabId: 'tab-1',
+          leafId: TEST_LEAF_1,
+          ptyId: 'claude-session-1',
+          claudeSharedAccountId: 'account-a'
+        })
+      ).toBe(true)
+      store.addClaudeLivePtySessionId('claude-session-1', 'account-a')
+
+      expect(flush).toHaveBeenCalledTimes(1)
+      expect(store.getClaudeLiveSharedPtyAccountBindings()).toEqual([
+        { sessionId: 'claude-session-1', accountId: 'account-a' }
+      ])
+    })
+
+    it.each([
+      ['UUID leaf', TEST_LEAF_1],
+      ['legacy leaf', 'legacy-pane-id']
+    ])(
+      'rearms unrelated pending state after a transient coalesced %s failure',
+      async (_, leafId) => {
+        const store = await createStore()
+        store.updateSettings({ terminalFontSize: 19 })
+        chmodSync(testState.dir, 0o500)
+        try {
+          expect(() =>
+            store.persistPtyBinding({
+              worktreeId: 'repo-1::/tmp/worktree',
+              tabId: 'tab-1',
+              leafId,
+              ptyId: 'claude-session-1',
+              claudeAccountId: 'account-a',
+              claudeSharedAccountId: 'account-a'
+            })
+          ).toThrow()
+          expect(
+            (store as unknown as { writeTimer: ReturnType<typeof setTimeout> | null }).writeTimer
+          ).not.toBeNull()
+        } finally {
+          chmodSync(testState.dir, 0o700)
+        }
+
+        store.flush()
+        const reloaded = await createStore()
+        expect(reloaded.getSettings().terminalFontSize).toBe(19)
+        expect(reloaded.getClaudeLivePtyAccountBindings()).toEqual([])
+        expect(reloaded.getClaudeLiveSharedPtyAccountBindings()).toEqual([])
+      }
+    )
+
+    it('rearms unrelated pending state after a transient binding write failure', async () => {
+      const store = await createStore()
+      store.updateSettings({ terminalFontSize: 19 })
+      chmodSync(testState.dir, 0o500)
+      try {
+        expect(() =>
+          store.addClaudeLivePtyAccountBinding('claude-session-1', 'account-a')
+        ).toThrow()
+        expect(
+          (store as unknown as { writeTimer: ReturnType<typeof setTimeout> | null }).writeTimer
+        ).not.toBeNull()
+      } finally {
+        chmodSync(testState.dir, 0o700)
+      }
+
+      store.flush()
+      const reloaded = await createStore()
+      expect(reloaded.getSettings().terminalFontSize).toBe(19)
+      expect(reloaded.getClaudeLivePtyAccountBindings()).toEqual([])
+    })
+  })
+
+  describe('Claude account state transactions', () => {
+    const account = {
+      id: 'account-a',
+      email: 'a@example.test',
+      managedAuthPath: '/tmp/orca-account-a/auth',
+      authMethod: 'subscription-oauth' as const,
+      organizationUuid: null,
+      organizationName: null,
+      createdAt: 1,
+      updatedAt: 1,
+      lastAuthenticatedAt: 1
+    }
+
+    it('persists account removal and pin cleanup in one flush', async () => {
+      const store = await createStore()
+      store.updateSettings({
+        claudeManagedAccounts: [account],
+        activeClaudeManagedAccountId: 'account-a',
+        activeClaudeManagedAccountIdsByRuntime: { host: 'account-a', wsl: {} }
+      })
+      store.setWorktreeMeta('worktree-a', { claudeAccountId: 'account-a' })
+      store.flush()
+      const flush = vi.spyOn(store as unknown as { flushOrThrow(): void }, 'flushOrThrow')
+
+      store.commitClaudeAccountState(
+        {
+          claudeManagedAccounts: [],
+          activeClaudeManagedAccountId: null,
+          activeClaudeManagedAccountIdsByRuntime: { host: null, wsl: {} }
+        },
+        { 'worktree-a': null }
+      )
+
+      expect(flush).toHaveBeenCalledTimes(1)
+      const reloaded = await createStore()
+      expect(reloaded.getSettings().claudeManagedAccounts).toEqual([])
+      expect(reloaded.getWorktreeMeta('worktree-a')?.claudeAccountId).toBeNull()
+    })
+
+    it('rolls back both account state and pins after a transaction write failure', async () => {
+      const store = await createStore()
+      store.updateSettings({ claudeManagedAccounts: [account] })
+      store.setWorktreeMeta('worktree-a', { claudeAccountId: 'account-a' })
+      store.flush()
+      chmodSync(testState.dir, 0o500)
+      try {
+        expect(() =>
+          store.commitClaudeAccountState({ claudeManagedAccounts: [] }, { 'worktree-a': null })
+        ).toThrow()
+        expect(store.getSettings().claudeManagedAccounts).toEqual([account])
+        expect(store.getWorktreeMeta('worktree-a')?.claudeAccountId).toBe('account-a')
+      } finally {
+        chmodSync(testState.dir, 0o700)
+      }
+      store.flush()
+      const reloaded = await createStore()
+      expect(reloaded.getSettings().claudeManagedAccounts).toEqual([account])
+      expect(reloaded.getWorktreeMeta('worktree-a')?.claudeAccountId).toBe('account-a')
     })
   })
 

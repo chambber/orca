@@ -26,6 +26,7 @@ import {
   Kanban,
   Trash2,
   Unlink,
+  UserCog,
   Workflow,
   FolderInput,
   FolderPlus,
@@ -35,7 +36,13 @@ import { useAppStore } from '@/store'
 import type { AppState } from '@/store/types'
 import { useAllWorktrees, useRepoById, useRepoMap, useWorktreeMap } from '@/store/selectors'
 import { cn } from '@/lib/utils'
-import type { Repo, Worktree } from '../../../../shared/types'
+import {
+  filterClaudeAccountsByWorktreeRuntimes,
+  INHERIT_GLOBAL_CLAUDE_ACCOUNT_VALUE,
+  isLocalClaudeAccountWorktreeTarget
+} from '@/lib/claude-account-runtime-filter'
+import { getLocalProjectExecutionRuntimeContext } from '@/lib/local-preflight-context'
+import type { ClaudeManagedAccountSummary, Repo, Worktree } from '../../../../shared/types'
 import { runWorktreeBatchDelete, runWorktreeDelete } from './delete-worktree-flow'
 import { runSleepWorktrees } from './sleep-worktree-flow'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
@@ -49,6 +56,7 @@ import { WorktreeParentPickerPopover } from './WorktreeParentPickerPopover'
 import { getEligibleWorktreeParents } from './worktree-parent-candidates'
 import { isEventTargetInsideCurrentTarget } from './worktree-card-dom-events'
 import { translate } from '@/i18n/i18n'
+import { isWebClientLocation } from '@/lib/web-client-location'
 import {
   folderWorkspaceKey,
   parseWorkspaceKey,
@@ -82,6 +90,20 @@ const EMPTY_BROWSER_TABS_BY_WORKTREE: AppState['browserTabsByWorktree'] = {}
 const EMPTY_DELETE_STATE_BY_WORKTREE_ID: AppState['deleteStateByWorktreeId'] = {}
 const EMPTY_WORKTREE_LINEAGE_BY_ID: AppState['worktreeLineageById'] = {}
 const EMPTY_WORKSPACE_LINEAGE_BY_CHILD_KEY: AppState['workspaceLineageByChildKey'] = {}
+
+export function canAssignClaudeAccountsToWorktrees(
+  worktrees: readonly Worktree[],
+  repoMap: ReadonlyMap<string, Repo>,
+  isPairedWebClient: boolean
+): boolean {
+  return (
+    !isPairedWebClient &&
+    worktrees.length > 0 &&
+    worktrees.every((worktree) =>
+      isLocalClaudeAccountWorktreeTarget(worktree, repoMap.get(worktree.repoId))
+    )
+  )
+}
 
 // Why: the gating decision for the menu-only store subscriptions. When the menu is
 // closed we MUST return the same `empty` reference every render so Zustand's Object.is
@@ -273,6 +295,7 @@ const WorktreeContextMenu = React.memo(function WorktreeContextMenu({
   const defaultSelectedWorktrees = useMemo(() => [worktree], [worktree])
   const effectiveSelectedWorktrees = selectedWorktrees ?? defaultSelectedWorktrees
   const updateWorktreeMeta = useAppStore((s) => s.updateWorktreeMeta)
+  const updateWorktreesMeta = useAppStore((s) => s.updateWorktreesMeta)
   const setWorktreesPinnedAndReveal = useAppStore((s) => s.setWorktreesPinnedAndReveal)
   const workspaceStatuses = useAppStore((s) => s.workspaceStatuses)
   const openModal = useAppStore((s) => s.openModal)
@@ -284,6 +307,7 @@ const WorktreeContextMenu = React.memo(function WorktreeContextMenu({
   const repo = useRepoById(worktree.repoId)
   const deleteState = useAppStore((s) => s.deleteStateByWorktreeId[worktree.id])
   const [menuOpen, setMenuOpen] = useState(false)
+  const [claudeAccounts, setClaudeAccounts] = useState<ClaudeManagedAccountSummary[]>([])
   const [menuPoint, setMenuPoint] = useState({ x: 0, y: 0 })
   const [contextWorktrees, setContextWorktrees] = useState<readonly Worktree[]>(
     effectiveSelectedWorktrees
@@ -359,6 +383,51 @@ const WorktreeContextMenu = React.memo(function WorktreeContextMenu({
       ? status
       : ''
   }, [activeContextWorktrees, workspaceStatuses])
+  const canAssignClaudeAccount = canAssignClaudeAccountsToWorktrees(
+    activeContextWorktrees,
+    repoMap,
+    isWebClientLocation()
+  )
+  // Why: one batch action must be valid for every selected worktree; using an
+  // intersection prevents a host/WSL mixed selection from silently falling back.
+  const filteredClaudeAccounts = useMemo(
+    () =>
+      menuOpen && canAssignClaudeAccount
+        ? filterClaudeAccountsByWorktreeRuntimes(
+            claudeAccounts,
+            activeContextWorktrees.map((item) => {
+              const projectRuntime = getLocalProjectExecutionRuntimeContext(
+                useAppStore.getState(),
+                item.id
+              )
+              return {
+                path: item.path,
+                launchRuntime:
+                  projectRuntime?.status === 'repair-required'
+                    ? ({ kind: 'unavailable' } as const)
+                    : projectRuntime?.runtime.kind === 'wsl'
+                      ? ({ kind: 'wsl', distro: projectRuntime.runtime.distro } as const)
+                      : projectRuntime
+                        ? ({ kind: 'host' } as const)
+                        : undefined
+              }
+            })
+          )
+        : [],
+    [activeContextWorktrees, canAssignClaudeAccount, claudeAccounts, menuOpen]
+  )
+  const contextClaudeAccountId = useMemo(() => {
+    const [first, ...rest] = activeContextWorktrees
+    if (!first) {
+      return ''
+    }
+    const accountId = first.claudeAccountId ?? INHERIT_GLOBAL_CLAUDE_ACCOUNT_VALUE
+    return rest.every(
+      (item) => (item.claudeAccountId ?? INHERIT_GLOBAL_CLAUDE_ACCOUNT_VALUE) === accountId
+    )
+      ? accountId
+      : ''
+  }, [activeContextWorktrees])
   const batchDeleteWorktrees = useMemo(
     () =>
       activeContextWorktrees.filter((item) => {
@@ -424,6 +493,30 @@ const WorktreeContextMenu = React.memo(function WorktreeContextMenu({
     []
   )
 
+  // Why: fetch managed Claude accounts only while the menu is open, mirroring
+  // selectMenuScopedMap's gating philosophy above — with potentially many
+  // sidebar rows mounted, an unconditional fetch-on-mount would fire one IPC
+  // call per row instead of once per actual open.
+  useEffect(() => {
+    if (!menuOpen || !canAssignClaudeAccount) {
+      return
+    }
+    let cancelled = false
+    void window.api.claudeAccounts
+      .list()
+      .then((result) => {
+        if (!cancelled) {
+          setClaudeAccounts(result.accounts)
+        }
+      })
+      .catch(() => {
+        // Non-fatal: the account action stays hidden when the list is unavailable.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [canAssignClaudeAccount, menuOpen])
+
   const handleCopyPath = useCallback(() => {
     window.api.ui.writeClipboardText(worktree.path)
   }, [worktree.path])
@@ -485,6 +578,19 @@ const WorktreeContextMenu = React.memo(function WorktreeContextMenu({
       )
     },
     [activeContextWorktrees, setMenuOpenState, updateWorktreeMeta, workspaceStatuses]
+  )
+
+  const handleAssignClaudeAccount = useCallback(
+    (accountId: string | null) => {
+      setMenuOpenState(false)
+      const updates = new Map(
+        activeContextWorktrees
+          .filter((item) => (item.claudeAccountId ?? null) !== accountId)
+          .map((item) => [item.id, { claudeAccountId: accountId }])
+      )
+      void updateWorktreesMeta(updates)
+    },
+    [activeContextWorktrees, setMenuOpenState, updateWorktreesMeta]
   )
 
   const handleRename = useCallback(() => {
@@ -731,6 +837,46 @@ const WorktreeContextMenu = React.memo(function WorktreeContextMenu({
               </DropdownMenuRadioGroup>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+          {canAssignClaudeAccount &&
+          (filteredClaudeAccounts.length > 0 ||
+            activeContextWorktrees.some((item) => item.claudeAccountId)) ? (
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger disabled={deletingContext}>
+                <UserCog className="size-3.5" />
+                {isMultiContext
+                  ? translate(
+                      'auto.components.sidebar.WorktreeContextMenu.assignAccountsTo',
+                      'Assign Accounts To'
+                    )
+                  : translate(
+                      'auto.components.sidebar.WorktreeContextMenu.assignAccount',
+                      'Assign Account'
+                    )}
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="w-48">
+                <DropdownMenuRadioGroup value={contextClaudeAccountId}>
+                  <DropdownMenuRadioItem
+                    value={INHERIT_GLOBAL_CLAUDE_ACCOUNT_VALUE}
+                    onSelect={() => handleAssignClaudeAccount(null)}
+                  >
+                    {translate(
+                      'auto.components.sidebar.WorktreeContextMenu.inheritGlobalAccount',
+                      'Inherit global'
+                    )}
+                  </DropdownMenuRadioItem>
+                  {filteredClaudeAccounts.map((account) => (
+                    <DropdownMenuRadioItem
+                      key={account.id}
+                      value={account.id}
+                      onSelect={() => handleAssignClaudeAccount(account.id)}
+                    >
+                      <span className="max-w-48 truncate">{account.email}</span>
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          ) : null}
           <DropdownMenuSeparator />
           {!isMultiContext && (
             <>

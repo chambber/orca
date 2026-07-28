@@ -156,6 +156,99 @@ describe('DaemonPtyRouter', () => {
     expect(current.write).toHaveBeenCalledWith(fresh.id, 'new\n')
   })
 
+  it('searches every daemon for an unmapped required reattach after discovery fails', async () => {
+    const current = createAdapter('current')
+    const legacy = createAdapter('legacy', ['legacy-session'])
+    vi.mocked(legacy.listProcesses).mockRejectedValueOnce(new Error('transient discovery failure'))
+    const router = new DaemonPtyRouter({ current, legacy: [legacy] })
+    await router.discoverLegacySessions()
+
+    await expect(
+      router.spawn({
+        sessionId: 'legacy-session',
+        requireReattach: true,
+        cols: 80,
+        rows: 24
+      })
+    ).resolves.toEqual({ id: 'legacy-session' })
+    expect(current.spawn).not.toHaveBeenCalled()
+    expect(legacy.spawn).toHaveBeenCalledOnce()
+  })
+
+  it('retains ambiguous ownership when an unmapped daemon cannot prove absence', async () => {
+    const current = createAdapter('current')
+    const legacy = createAdapter('legacy', ['legacy-session'])
+    vi.mocked(legacy.spawn).mockRejectedValue(new Error('legacy ownership is ambiguous'))
+    const router = new DaemonPtyRouter({ current, legacy: [legacy] })
+
+    await expect(
+      router.spawn({
+        sessionId: 'legacy-session',
+        requireReattach: true,
+        cols: 80,
+        rows: 24
+      })
+    ).rejects.toThrow('legacy ownership is ambiguous')
+  })
+
+  it('reports unavailable only after every daemon proves the session absent', async () => {
+    const current = createAdapter('current')
+    const legacy = createAdapter('legacy')
+    const router = new DaemonPtyRouter({ current, legacy: [legacy] })
+
+    await expect(
+      router.spawn({
+        sessionId: 'missing-session',
+        requireReattach: true,
+        cols: 80,
+        rows: 24
+      })
+    ).rejects.toThrow('PTY_REQUIRED_REATTACH_UNAVAILABLE')
+    expect(current.spawn).not.toHaveBeenCalled()
+    expect(legacy.spawn).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])(
+    'fails closed for %s mapped duplicate live owners',
+    async (discoverFirst) => {
+      const current = createAdapter('current', ['duplicate-session'])
+      const legacy = createAdapter('legacy', ['duplicate-session'])
+      const router = new DaemonPtyRouter({ current, legacy: [legacy] })
+      if (discoverFirst) {
+        await router.discoverLegacySessions()
+      }
+
+      await expect(
+        router.spawn({
+          sessionId: 'duplicate-session',
+          requireReattach: true,
+          cols: 80,
+          rows: 24
+        })
+      ).rejects.toThrow('PTY_REQUIRED_REATTACH_OWNER_AMBIGUOUS')
+      expect(current.spawn).not.toHaveBeenCalled()
+      expect(legacy.spawn).not.toHaveBeenCalled()
+    }
+  )
+
+  it('retains ownership when a provider inventory fails transiently', async () => {
+    const current = createAdapter('current')
+    const legacy = createAdapter('legacy', ['legacy-session'])
+    vi.mocked(current.listProcesses).mockRejectedValue(new Error('transient inventory failure'))
+    const router = new DaemonPtyRouter({ current, legacy: [legacy] })
+
+    await expect(
+      router.spawn({
+        sessionId: 'legacy-session',
+        requireReattach: true,
+        cols: 80,
+        rows: 24
+      })
+    ).rejects.toThrow('transient inventory failure')
+    expect(current.spawn).not.toHaveBeenCalled()
+    expect(legacy.spawn).not.toHaveBeenCalled()
+  })
+
   it('routes background hints and authoritative snapshots to the session owner', async () => {
     const current = createAdapter('current')
     const legacy = createAdapter('legacy', ['legacy-session'])

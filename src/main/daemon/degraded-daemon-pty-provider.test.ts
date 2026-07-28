@@ -140,6 +140,67 @@ describe('DegradedDaemonPtyProvider', () => {
     expect(fallback.write).toHaveBeenCalledWith(fresh.id, 'new\n')
   })
 
+  it('searches fallback and every daemon for an unmapped required reattach', async () => {
+    const current = createDaemonAdapter('daemon')
+    const legacy = createDaemonAdapter('legacy', ['legacy-session'])
+    const fallback = createProvider('fallback')
+    vi.mocked(legacy.listProcesses).mockRejectedValueOnce(new Error('transient discovery failure'))
+    const provider = new DegradedDaemonPtyProvider({ current, legacy: [legacy], fallback })
+    await provider.discoverDaemonSessions()
+
+    await expect(
+      provider.spawn({
+        sessionId: 'legacy-session',
+        requireReattach: true,
+        cols: 80,
+        rows: 24
+      })
+    ).resolves.toEqual({ id: 'legacy-session' })
+    expect(legacy.spawn).toHaveBeenCalledOnce()
+  })
+
+  it('does not treat one provider not-found as global proof after discovery fails', async () => {
+    const current = createDaemonAdapter('daemon')
+    const legacy = createDaemonAdapter('legacy', ['legacy-session'])
+    const fallback = createProvider('fallback')
+    vi.mocked(legacy.spawn).mockRejectedValue(new Error('legacy ownership is ambiguous'))
+    const provider = new DegradedDaemonPtyProvider({ current, legacy: [legacy], fallback })
+
+    await expect(
+      provider.spawn({
+        sessionId: 'legacy-session',
+        requireReattach: true,
+        cols: 80,
+        rows: 24
+      })
+    ).rejects.toThrow('legacy ownership is ambiguous')
+  })
+
+  it.each([false, true])(
+    'fails closed for %s mapped duplicate daemon owners in degraded mode',
+    async (discoverFirst) => {
+      const current = createDaemonAdapter('daemon', ['duplicate-session'])
+      const legacy = createDaemonAdapter('legacy', ['duplicate-session'])
+      const fallback = createProvider('fallback')
+      const provider = new DegradedDaemonPtyProvider({ current, legacy: [legacy], fallback })
+      if (discoverFirst) {
+        await provider.discoverDaemonSessions()
+      }
+
+      await expect(
+        provider.spawn({
+          sessionId: 'duplicate-session',
+          requireReattach: true,
+          cols: 80,
+          rows: 24
+        })
+      ).rejects.toThrow('PTY_REQUIRED_REATTACH_OWNER_AMBIGUOUS')
+      expect(fallback.spawn).not.toHaveBeenCalled()
+      expect(current.spawn).not.toHaveBeenCalled()
+      expect(legacy.spawn).not.toHaveBeenCalled()
+    }
+  )
+
   it('routes a previously daemon-backed id to fallback after daemon exit removes the mapping', async () => {
     const current = createDaemonAdapter('daemon', ['daemon-session'])
     const fallback = createProvider('fallback')

@@ -202,7 +202,12 @@ import {
   isHiddenRendererPty
 } from './pty-hidden-delivery-gate'
 import { OrcaRuntimeService } from '../runtime/orca-runtime'
-import { hasLiveClaudePtys, markClaudePtySpawned } from '../claude-accounts/live-pty-gate'
+import {
+  beginClaudeAuthSwitch,
+  endClaudeAuthSwitch,
+  hasLiveClaudePtys,
+  markClaudePtySpawned
+} from '../claude-accounts/live-pty-gate'
 import * as livePtyGate from '../claude-accounts/live-pty-gate'
 import {
   encodePowerShellCommand,
@@ -433,6 +438,11 @@ describe('registerPtyHandlers', () => {
       unregisterSshPtyProvider(leakedConnectionId)
     }
     setLocalPtyProvider(new LocalPtyProvider())
+    // Why: the global switch-block tests below leave this set if they throw
+    // before reaching their own cleanup; reset it unconditionally so a
+    // failure can't leak isClaudeAuthSwitchInProgress() === true into
+    // unrelated later tests in this file.
+    endClaudeAuthSwitch()
     if (savedProcessPlatform) {
       Object.defineProperty(process, 'platform', savedProcessPlatform)
     }
@@ -582,6 +592,7 @@ describe('registerPtyHandlers', () => {
       | ((payload: { id: string; kind: 'dataGap'; droppedChars: number }) => void)
       | null = null
     const getBufferSnapshot = vi.fn()
+    const listProcesses = vi.fn(async () => [] as { id: string; cwd: string; title: string }[])
     setLocalPtyProvider({
       spawn,
       write,
@@ -616,7 +627,7 @@ describe('registerPtyHandlers', () => {
         exitHandler = handler
         return () => {}
       }),
-      listProcesses: vi.fn(async () => []),
+      listProcesses,
       attach: vi.fn(),
       getDefaultShell: vi.fn(),
       getProfiles: vi.fn()
@@ -627,6 +638,7 @@ describe('registerPtyHandlers', () => {
       pauseProducer,
       resumeProducer,
       getBufferSnapshot,
+      listProcesses,
       emitData: (id: string, data: string) => dataHandler?.({ id, data }),
       emitExit: (id: string, code = 0) => exitHandler?.({ id, code }),
       emitDataGap: (id: string, droppedChars: number) =>
@@ -836,6 +848,918 @@ describe('registerPtyHandlers', () => {
       await handlers.get('pty:kill')!(null, { id: spawnResult.id })
 
       expect(hasLiveClaudePtys()).toBe(false)
+    })
+
+    it('does not block an injected (per-worktree-pinned) Claude launch while a global account switch is in progress', async () => {
+      const prepareClaudeAuth = vi.fn(async () => ({
+        configDir: '/tmp/claude-injected',
+        envPatch: { CLAUDE_CONFIG_DIR: '/tmp/claude-injected' },
+        stripAuthEnv: true,
+        injectedAccountId: 'account-injected',
+        provenance: 'managed:account-injected:injected'
+      }))
+      const store = {
+        getWorktreeMeta: vi.fn(() => ({ claudeAccountId: 'account-injected' }))
+      }
+      const isInjectedClaudeAccountTarget = vi.fn(
+        (target?: { overrideAccountId?: string | null }) =>
+          target?.overrideAccountId === 'account-injected'
+      )
+      registerPtyHandlers(
+        mainWindow as never,
+        undefined,
+        undefined,
+        undefined,
+        prepareClaudeAuth,
+        store as never,
+        undefined,
+        isInjectedClaudeAccountTarget
+      )
+
+      beginClaudeAuthSwitch()
+      try {
+        const spawnResult = (await handlers.get('pty:spawn')!(null, {
+          cols: 80,
+          rows: 24,
+          command: 'claude',
+          worktreeId: 'wt-injected'
+        })) as { id: string }
+
+        expect(spawnResult.id).toBeDefined()
+        expect(isInjectedClaudeAccountTarget).toHaveBeenCalledWith(
+          expect.objectContaining({ overrideAccountId: 'account-injected' })
+        )
+        expect(prepareClaudeAuth).toHaveBeenCalledTimes(1)
+        expect(prepareClaudeAuth).toHaveBeenCalledWith(
+          expect.objectContaining({ overrideAccountId: 'account-injected' })
+        )
+        expect(hasLiveClaudePtys()).toBe(false)
+        expect(livePtyGate.hasLiveInjectedClaudePtysForAccount('account-injected')).toBe(true)
+
+        await handlers.get('pty:kill')!(null, { id: spawnResult.id })
+        expect(livePtyGate.hasLiveInjectedClaudePtysForAccount('account-injected')).toBe(false)
+      } finally {
+        endClaudeAuthSwitch()
+      }
+    })
+
+    it('releases injected account ownership when renderer provider spawn fails', async () => {
+      const reservationId = livePtyGate.reserveInjectedClaudeAccountLaunch('account-injected')
+      const prepareClaudeAuth = vi.fn(async () => ({
+        configDir: '/tmp/claude-injected',
+        envPatch: { CLAUDE_CONFIG_DIR: '/tmp/claude-injected' },
+        stripAuthEnv: true,
+        injectedAccountId: 'account-injected',
+        injectedAccountReservationId: reservationId,
+        provenance: 'managed:account-injected:injected'
+      }))
+      const store = {
+        getWorktreeMeta: vi.fn(() => ({ claudeAccountId: 'account-injected' }))
+      }
+      spawnMock.mockImplementation(() => {
+        throw new Error('provider spawn failed')
+      })
+      registerPtyHandlers(
+        mainWindow as never,
+        undefined,
+        undefined,
+        undefined,
+        prepareClaudeAuth,
+        store as never,
+        undefined,
+        () => true
+      )
+
+      await expect(
+        handlers.get('pty:spawn')!(null, {
+          cols: 80,
+          rows: 24,
+          command: 'claude',
+          worktreeId: 'wt-injected'
+        })
+      ).rejects.toThrow()
+
+      expect(livePtyGate.hasLiveInjectedClaudePtysForAccount('account-injected')).toBe(false)
+    })
+
+    it('releases shared launch ownership when renderer provider spawn fails', async () => {
+      const reservationId = livePtyGate.reserveSharedClaudeAccountLaunch('account-global')
+      const prepareClaudeAuth = vi.fn(async () => ({
+        configDir: '/tmp/claude',
+        envPatch: {},
+        stripAuthEnv: false,
+        sharedAccountReservationId: reservationId,
+        provenance: 'managed:account-global'
+      }))
+      spawnMock.mockImplementation(() => {
+        throw new Error('provider spawn failed')
+      })
+      registerPtyHandlers(mainWindow as never, undefined, undefined, undefined, prepareClaudeAuth)
+
+      await expect(
+        handlers.get('pty:spawn')!(null, {
+          cols: 80,
+          rows: 24,
+          command: 'claude'
+        })
+      ).rejects.toThrow()
+
+      beginClaudeAuthSwitch()
+      expect(livePtyGate.isClaudeAuthSwitchInProgress()).toBe(true)
+      endClaudeAuthSwitch()
+    })
+
+    it('reattaches with the PTY account even after the worktree is repinned', async () => {
+      livePtyGate.markInjectedClaudePtySpawned('surviving-session', 'account-a')
+      const prepareClaudeAuth = vi.fn(async () => ({
+        configDir: '/tmp/account-a',
+        envPatch: { CLAUDE_CONFIG_DIR: '/tmp/account-a' },
+        stripAuthEnv: true,
+        injectedAccountId: 'account-a',
+        provenance: 'managed:account-a:injected'
+      }))
+      const store = { getWorktreeMeta: vi.fn(() => ({ claudeAccountId: 'account-b' })) }
+      registerPtyHandlers(
+        mainWindow as never,
+        undefined,
+        undefined,
+        undefined,
+        prepareClaudeAuth,
+        store as never,
+        undefined,
+        () => true
+      )
+
+      const spawnResult = (await handlers.get('pty:spawn')!(null, {
+        cols: 80,
+        rows: 24,
+        command: 'claude',
+        worktreeId: 'wt-injected',
+        sessionId: 'surviving-session'
+      })) as { id: string }
+
+      expect(prepareClaudeAuth).toHaveBeenCalledWith(
+        expect.objectContaining({ overrideAccountId: 'account-a' })
+      )
+      expect(livePtyGate.getLiveInjectedClaudePtyAccountId('surviving-session')).toBe('account-a')
+      await handlers.get('pty:kill')!(null, { id: spawnResult.id })
+      livePtyGate.markClaudePtyExited('surviving-session')
+    })
+
+    it.each(['live gate', 'restart seed'] as const)(
+      'keeps a shared reattach shared after repinning via the %s',
+      async (ownershipSource) => {
+        await getLocalPtyProvider().spawn({
+          cols: 80,
+          rows: 24,
+          sessionId: 'surviving-shared-session'
+        })
+        spawnMock.mockClear()
+        if (ownershipSource === 'restart seed') {
+          livePtyGate.seedLiveClaudePtysFromPersistence(['surviving-shared-session'])
+        } else {
+          markClaudePtySpawned('surviving-shared-session')
+        }
+        livePtyGate.markInjectedClaudePtySpawned('injected-account-b', 'account-b')
+        const prepareClaudeAuth = vi.fn(async () => {
+          const sharedAccountReservationId =
+            livePtyGate.reserveSharedClaudeAccountLaunch('account-b')
+          return {
+            configDir: '/tmp/claude-shared',
+            envPatch: {},
+            stripAuthEnv: false,
+            sharedAccountId: 'account-b',
+            sharedAccountReservationId,
+            provenance: 'managed:account-b'
+          }
+        })
+        const store = {
+          getWorktreeMeta: vi.fn(() => ({ claudeAccountId: 'newly-pinned-account' }))
+        }
+        const isInjectedClaudeAccountTarget = vi.fn(
+          (target?: { overrideAccountId?: string | null }) => Boolean(target?.overrideAccountId)
+        )
+        registerPtyHandlers(
+          mainWindow as never,
+          undefined,
+          undefined,
+          undefined,
+          prepareClaudeAuth,
+          store as never,
+          undefined,
+          isInjectedClaudeAccountTarget
+        )
+
+        try {
+          const spawnResult = (await handlers.get('pty:spawn')!(null, {
+            cols: 80,
+            rows: 24,
+            command: 'claude',
+            worktreeId: 'wt-shared',
+            sessionId: 'surviving-shared-session'
+          })) as { id: string }
+
+          expect(prepareClaudeAuth).not.toHaveBeenCalled()
+          expect(isInjectedClaudeAccountTarget).toHaveBeenCalledWith(
+            expect.objectContaining({ overrideAccountId: null })
+          )
+          expect(
+            livePtyGate.getLiveInjectedClaudePtyAccountId('surviving-shared-session')
+          ).toBeNull()
+          expect(spawnMock).not.toHaveBeenCalled()
+          await handlers.get('pty:kill')!(null, { id: spawnResult.id })
+        } finally {
+          livePtyGate.markClaudePtyExited('surviving-shared-session')
+          livePtyGate.markClaudePtyExited('injected-account-b')
+        }
+      }
+    )
+
+    it('keeps a runtime-controller shared reattach shared after repinning', async () => {
+      const runtime = {
+        setPtyController: vi.fn(),
+        registerPty: vi.fn(),
+        noteTerminalSpawnCommand: vi.fn(),
+        onPtySpawned: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn(),
+        preAllocateHandleForPty: vi.fn()
+      }
+      await getLocalPtyProvider().spawn({
+        cols: 80,
+        rows: 24,
+        sessionId: 'runtime-shared-session'
+      })
+      spawnMock.mockClear()
+      markClaudePtySpawned('runtime-shared-session', 'account-a')
+      livePtyGate.markInjectedClaudePtySpawned('runtime-injected-account-b', 'account-b')
+      const prepareClaudeAuth = vi.fn(async () => {
+        const sharedAccountReservationId = livePtyGate.reserveSharedClaudeAccountLaunch('account-b')
+        return {
+          configDir: '/tmp/claude-shared',
+          envPatch: {},
+          stripAuthEnv: false,
+          sharedAccountId: 'account-b',
+          sharedAccountReservationId,
+          provenance: 'managed:account-b'
+        }
+      })
+      const store = {
+        getWorktreeMeta: vi.fn(() => ({ claudeAccountId: 'newly-pinned-account' }))
+      }
+      registerPtyHandlers(
+        mainWindow as never,
+        runtime as never,
+        undefined,
+        undefined,
+        prepareClaudeAuth,
+        store as never,
+        undefined,
+        (target) => Boolean(target?.overrideAccountId)
+      )
+      const controller = runtime.setPtyController.mock.calls[0]?.[0] as {
+        spawn(args: {
+          cols: number
+          rows: number
+          command: string
+          worktreeId: string
+          sessionId: string
+        }): Promise<{ id: string }>
+      }
+
+      try {
+        await controller.spawn({
+          cols: 80,
+          rows: 24,
+          command: 'claude',
+          worktreeId: 'wt-shared',
+          sessionId: 'runtime-shared-session'
+        })
+
+        expect(prepareClaudeAuth).not.toHaveBeenCalled()
+        expect(livePtyGate.getLiveSharedClaudePtyAccountId('runtime-shared-session')).toBe(
+          'account-a'
+        )
+        expect(spawnMock).not.toHaveBeenCalled()
+      } finally {
+        livePtyGate.markClaudePtyExited('runtime-shared-session')
+        livePtyGate.markClaudePtyExited('runtime-injected-account-b')
+      }
+    })
+
+    it('clears stale shared ownership when runtime-controller attach-only fails', async () => {
+      const runtime = {
+        setPtyController: vi.fn(),
+        registerPty: vi.fn(),
+        noteTerminalSpawnCommand: vi.fn(),
+        onPtySpawned: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn(),
+        preAllocateHandleForPty: vi.fn()
+      }
+      markClaudePtySpawned('runtime-stale-shared-session', 'account-a')
+      const prepareClaudeAuth = vi.fn()
+      registerPtyHandlers(
+        mainWindow as never,
+        runtime as never,
+        undefined,
+        undefined,
+        prepareClaudeAuth
+      )
+      const controller = runtime.setPtyController.mock.calls[0]?.[0] as {
+        spawn(args: {
+          cols: number
+          rows: number
+          command: string
+          sessionId: string
+        }): Promise<{ id: string }>
+      }
+      spawnMock.mockClear()
+
+      try {
+        await expect(
+          controller.spawn({
+            cols: 80,
+            rows: 24,
+            command: 'claude',
+            sessionId: 'runtime-stale-shared-session'
+          })
+        ).rejects.toThrow('is no longer available to reattach')
+        expect(prepareClaudeAuth).not.toHaveBeenCalled()
+        expect(spawnMock).not.toHaveBeenCalled()
+        expect(livePtyGate.isLiveSharedClaudePty('runtime-stale-shared-session')).toBe(false)
+      } finally {
+        livePtyGate.markClaudePtyExited('runtime-stale-shared-session')
+      }
+    })
+
+    it('does not replace a stale shared session under the currently materialized account', async () => {
+      markClaudePtySpawned('stale-shared-session', 'account-a')
+      const prepareClaudeAuth = vi.fn()
+      registerPtyHandlers(mainWindow as never, undefined, undefined, undefined, prepareClaudeAuth)
+      spawnMock.mockClear()
+      classifyErrorMock.mockReturnValue({ error_class: 'unknown' })
+
+      try {
+        await expect(
+          handlers.get('pty:spawn')!(null, {
+            cols: 80,
+            rows: 24,
+            command: 'claude',
+            sessionId: 'stale-shared-session'
+          })
+        ).rejects.toThrow('is no longer available to reattach')
+        expect(prepareClaudeAuth).not.toHaveBeenCalled()
+        expect(spawnMock).not.toHaveBeenCalled()
+        expect(livePtyGate.isLiveSharedClaudePty('stale-shared-session')).toBe(false)
+      } finally {
+        livePtyGate.markClaudePtyExited('stale-shared-session')
+      }
+    })
+
+    it.each(['shared', 'injected'] as const)(
+      'retains %s account ownership until every duplicate provider owner exits',
+      async (ownershipMode) => {
+        const provider = installObservableDaemonTestProvider()
+        const runtime = {
+          setPtyController: vi.fn(),
+          onPtyExit: vi.fn(),
+          onPtyData: vi.fn()
+        }
+        handlers.clear()
+        registerPtyHandlers(mainWindow as never, runtime as never)
+        if (ownershipMode === 'shared') {
+          markClaudePtySpawned('duplicate-claude-session', 'account-a')
+        } else {
+          livePtyGate.markInjectedClaudePtySpawned('duplicate-claude-session', 'account-a')
+        }
+        provider.listProcesses.mockResolvedValue([
+          { id: 'duplicate-claude-session', cwd: '', title: 'surviving owner' }
+        ])
+        if (ownershipMode === 'shared') {
+          provider.listProcesses.mockRejectedValueOnce(new Error('transient inventory failure'))
+        }
+
+        try {
+          provider.emitExit('duplicate-claude-session', 0)
+          await new Promise((resolve) => setTimeout(resolve, ownershipMode === 'shared' ? 175 : 75))
+
+          expect(runtime.onPtyExit).not.toHaveBeenCalled()
+          expect(
+            ownershipMode === 'shared'
+              ? livePtyGate.isLiveSharedClaudePty('duplicate-claude-session')
+              : livePtyGate.getLiveInjectedClaudePtyAccountId('duplicate-claude-session') !== null
+          ).toBe(true)
+
+          provider.listProcesses.mockResolvedValue([])
+          provider.emitExit('duplicate-claude-session', 0)
+          provider.emitExit('duplicate-claude-session', 0)
+          await vi.waitFor(() => expect(runtime.onPtyExit).toHaveBeenCalledOnce(), { timeout: 500 })
+
+          expect(livePtyGate.isLiveSharedClaudePty('duplicate-claude-session')).toBe(false)
+          expect(
+            livePtyGate.getLiveInjectedClaudePtyAccountId('duplicate-claude-session')
+          ).toBeNull()
+        } finally {
+          livePtyGate.markClaudePtyExited('duplicate-claude-session')
+        }
+      }
+    )
+
+    it('does not apply an old provider exit proof to a reused session after rebind', async () => {
+      let resolveOldInventory!: (sessions: { id: string; cwd: string; title: string }[]) => void
+      const oldInventory = new Promise<{ id: string; cwd: string; title: string }[]>((resolve) => {
+        resolveOldInventory = resolve
+      })
+      const oldProvider = installObservableDaemonTestProvider()
+      oldProvider.listProcesses.mockReturnValueOnce(oldInventory)
+      const runtime = {
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, runtime as never)
+      markClaudePtySpawned('reused-claude-session', 'account-a')
+
+      try {
+        oldProvider.emitExit('reused-claude-session', 0)
+        await vi.waitFor(() => expect(oldProvider.listProcesses).toHaveBeenCalledOnce())
+
+        const newProvider = installObservableDaemonTestProvider()
+        newProvider.listProcesses.mockResolvedValue([
+          { id: 'reused-claude-session', cwd: '', title: 'new owner' }
+        ])
+        rebindLocalProviderListeners()
+        await vi.waitFor(() => expect(newProvider.listProcesses).toHaveBeenCalledTimes(2))
+        resolveOldInventory([])
+        await Promise.resolve()
+
+        expect(runtime.onPtyExit).not.toHaveBeenCalled()
+        expect(livePtyGate.isLiveSharedClaudePty('reused-claude-session')).toBe(true)
+      } finally {
+        livePtyGate.markClaudePtyExited('reused-claude-session')
+      }
+    })
+
+    it('does not apply an old exit proof after same-ID Claude ownership is renewed', async () => {
+      let resolveOldInventory!: (sessions: { id: string; cwd: string; title: string }[]) => void
+      const oldInventory = new Promise<{ id: string; cwd: string; title: string }[]>((resolve) => {
+        resolveOldInventory = resolve
+      })
+      const provider = installObservableDaemonTestProvider()
+      provider.listProcesses.mockReturnValueOnce(oldInventory)
+      const runtime = {
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, runtime as never)
+      livePtyGate.markInjectedClaudePtySpawned('renewed-claude-session', 'account-a')
+
+      try {
+        provider.emitExit('renewed-claude-session', 0)
+        await vi.waitFor(() => expect(provider.listProcesses).toHaveBeenCalledOnce())
+        livePtyGate.markInjectedClaudePtySpawned('renewed-claude-session', 'account-a')
+        resolveOldInventory([])
+        await new Promise((resolve) => setTimeout(resolve, 25))
+
+        expect(runtime.onPtyExit).not.toHaveBeenCalled()
+        expect(livePtyGate.getLiveInjectedClaudePtyAccountId('renewed-claude-session')).toBe(
+          'account-a'
+        )
+      } finally {
+        livePtyGate.markClaudePtyExited('renewed-claude-session')
+      }
+    })
+
+    it('batches pending Claude exit inventory when the provider is rebound', async () => {
+      let resolveOldInventory!: (sessions: { id: string; cwd: string; title: string }[]) => void
+      const oldInventory = new Promise<{ id: string; cwd: string; title: string }[]>((resolve) => {
+        resolveOldInventory = resolve
+      })
+      const oldProvider = installObservableDaemonTestProvider()
+      oldProvider.listProcesses.mockReturnValueOnce(oldInventory)
+      const runtime = {
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, runtime as never)
+      const sessionIds = Array.from({ length: 50 }, (_, index) => `batched-claude-${index}`)
+
+      try {
+        for (const sessionId of sessionIds) {
+          livePtyGate.markInjectedClaudePtySpawned(sessionId, 'account-a')
+          oldProvider.emitExit(sessionId, -1)
+        }
+        await vi.waitFor(() => expect(oldProvider.listProcesses).toHaveBeenCalledOnce())
+
+        const newProvider = installObservableDaemonTestProvider()
+        newProvider.listProcesses.mockResolvedValue([])
+        rebindLocalProviderListeners()
+        await vi.waitFor(() => expect(runtime.onPtyExit).toHaveBeenCalledTimes(sessionIds.length))
+
+        expect(newProvider.listProcesses).toHaveBeenCalledOnce()
+        resolveOldInventory([])
+      } finally {
+        for (const sessionId of sessionIds) {
+          livePtyGate.markClaudePtyExited(sessionId)
+        }
+      }
+    })
+
+    it('coalesces staggered Claude exits into one scheduled inventory retry', async () => {
+      vi.useFakeTimers()
+      const provider = installObservableDaemonTestProvider()
+      const sessionIds = Array.from({ length: 200 }, (_, index) => `staggered-claude-${index}`)
+      provider.listProcesses.mockResolvedValue(
+        sessionIds.map((id) => ({ id, cwd: '', title: 'surviving owner' }))
+      )
+      const runtime = {
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, runtime as never)
+      const baselineTimerCount = vi.getTimerCount()
+
+      try {
+        livePtyGate.markInjectedClaudePtySpawned(sessionIds[0], 'account-a')
+        provider.emitExit(sessionIds[0], 0)
+        await vi.advanceTimersByTimeAsync(50)
+        expect(provider.listProcesses).toHaveBeenCalledTimes(2)
+
+        for (const sessionId of sessionIds.slice(1)) {
+          livePtyGate.markInjectedClaudePtySpawned(sessionId, 'account-a')
+          provider.emitExit(sessionId, 0)
+        }
+
+        expect(provider.listProcesses).toHaveBeenCalledTimes(2)
+        expect(vi.getTimerCount()).toBe(baselineTimerCount + 1)
+
+        for (const sessionId of sessionIds) {
+          livePtyGate.markClaudePtyExited(sessionId)
+        }
+        provider.listProcesses.mockResolvedValue([])
+        await vi.advanceTimersByTimeAsync(250)
+        expect(provider.listProcesses).toHaveBeenCalledTimes(3)
+        expect(vi.getTimerCount()).toBe(baselineTimerCount)
+      } finally {
+        for (const sessionId of sessionIds) {
+          livePtyGate.markClaudePtyExited(sessionId)
+        }
+        vi.useRealTimers()
+      }
+    })
+
+    it('keeps repeated same-ID exits on the shared steady-state retry cadence', async () => {
+      vi.useFakeTimers()
+      const provider = installObservableDaemonTestProvider()
+      provider.listProcesses.mockResolvedValue([
+        { id: 'repeated-claude-session', cwd: '', title: 'surviving owner' }
+      ])
+      const runtime = {
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, runtime as never)
+      const baselineTimerCount = vi.getTimerCount()
+      livePtyGate.markInjectedClaudePtySpawned('repeated-claude-session', 'account-a')
+
+      try {
+        provider.emitExit('repeated-claude-session', 0)
+        await vi.advanceTimersByTimeAsync(50)
+        await vi.advanceTimersByTimeAsync(250)
+        await vi.advanceTimersByTimeAsync(500)
+        await vi.advanceTimersByTimeAsync(1_000)
+        await vi.advanceTimersByTimeAsync(5_000)
+        expect(provider.listProcesses).toHaveBeenCalledTimes(6)
+
+        for (let index = 0; index < 29; index += 1) {
+          provider.emitExit('repeated-claude-session', 0)
+          await vi.advanceTimersByTimeAsync(1_000)
+        }
+
+        expect(provider.listProcesses).toHaveBeenCalledTimes(6)
+        expect(vi.getTimerCount()).toBe(baselineTimerCount + 1)
+
+        provider.listProcesses.mockResolvedValue([])
+        await vi.advanceTimersByTimeAsync(1_000)
+        expect(provider.listProcesses).toHaveBeenCalledTimes(7)
+        expect(runtime.onPtyExit).toHaveBeenCalledOnce()
+        expect(vi.getTimerCount()).toBe(baselineTimerCount)
+      } finally {
+        livePtyGate.markClaudePtyExited('repeated-claude-session')
+        vi.useRealTimers()
+      }
+    })
+
+    it('rechecks an ordinary exit across multiple late inventory settle windows', async () => {
+      const provider = installObservableDaemonTestProvider()
+      const liveInventory = [
+        { id: 'late-settling-claude-session', cwd: '', title: 'exiting owner' }
+      ]
+      provider.listProcesses
+        .mockResolvedValueOnce(liveInventory)
+        .mockResolvedValueOnce(liveInventory)
+        .mockResolvedValueOnce(liveInventory)
+        .mockResolvedValueOnce(liveInventory)
+        .mockResolvedValue([])
+      const runtime = {
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, runtime as never)
+      livePtyGate.markInjectedClaudePtySpawned('late-settling-claude-session', 'account-a')
+
+      try {
+        provider.emitExit('late-settling-claude-session', 0)
+
+        await vi.waitFor(() => expect(runtime.onPtyExit).toHaveBeenCalledOnce(), { timeout: 2_500 })
+        expect(provider.listProcesses).toHaveBeenCalledTimes(5)
+        expect(
+          livePtyGate.getLiveInjectedClaudePtyAccountId('late-settling-claude-session')
+        ).toBeNull()
+      } finally {
+        livePtyGate.markClaudePtyExited('late-settling-claude-session')
+      }
+    })
+
+    it('rechecks a restart exit against the replacement provider before cleanup', async () => {
+      const oldProvider = installObservableDaemonTestProvider()
+      oldProvider.listProcesses.mockResolvedValue([
+        { id: 'restarted-claude-session', cwd: '', title: 'old owner' }
+      ])
+      const runtime = {
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, runtime as never)
+      markClaudePtySpawned('restarted-claude-session', 'account-a')
+
+      try {
+        oldProvider.emitExit('restarted-claude-session', -1)
+        await vi.waitFor(() => expect(oldProvider.listProcesses).toHaveBeenCalledTimes(2))
+
+        const newProvider = installObservableDaemonTestProvider()
+        newProvider.listProcesses
+          .mockResolvedValueOnce([
+            { id: 'restarted-claude-session', cwd: '', title: 'replacement inventory lag' }
+          ])
+          .mockResolvedValueOnce([
+            { id: 'restarted-claude-session', cwd: '', title: 'replacement inventory lag' }
+          ])
+          .mockResolvedValue([])
+        rebindLocalProviderListeners()
+
+        await vi.waitFor(() => expect(runtime.onPtyExit).toHaveBeenCalledOnce(), { timeout: 500 })
+        expect(newProvider.listProcesses).toHaveBeenCalledTimes(3)
+        expect(runtime.onPtyExit).toHaveBeenCalledWith('restarted-claude-session', -1)
+        expect(livePtyGate.isLiveSharedClaudePty('restarted-claude-session')).toBe(false)
+        expect(
+          mainWindow.webContents.send.mock.calls.filter(
+            (call) => call[0] === 'pty:exit' && call[1]?.id === 'restarted-claude-session'
+          )
+        ).toHaveLength(1)
+      } finally {
+        livePtyGate.markClaudePtyExited('restarted-claude-session')
+      }
+    })
+
+    it('retries a current-generation restart exit after inventory errors recover', async () => {
+      const provider = installObservableDaemonTestProvider()
+      provider.listProcesses
+        .mockRejectedValueOnce(new Error('inventory unavailable 1'))
+        .mockRejectedValueOnce(new Error('inventory unavailable 2'))
+        .mockRejectedValueOnce(new Error('inventory unavailable 3'))
+        .mockResolvedValue([])
+      const runtime = {
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, runtime as never)
+      markClaudePtySpawned('restart-inventory-error-session', 'account-a')
+
+      try {
+        provider.emitExit('restart-inventory-error-session', -1)
+
+        await vi.waitFor(() => expect(runtime.onPtyExit).toHaveBeenCalledOnce(), { timeout: 800 })
+        expect(provider.listProcesses).toHaveBeenCalledTimes(4)
+        expect(livePtyGate.isLiveSharedClaudePty('restart-inventory-error-session')).toBe(false)
+      } finally {
+        livePtyGate.markClaudePtyExited('restart-inventory-error-session')
+      }
+    })
+
+    it('transfers scheduled Claude exit reconciliation to a new window registration', async () => {
+      vi.useFakeTimers()
+      const provider = installObservableDaemonTestProvider()
+      provider.listProcesses.mockResolvedValue([
+        { id: 'window-reconcile-session', cwd: '', title: 'surviving owner' }
+      ])
+      const oldRuntime = {
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, oldRuntime as never)
+      livePtyGate.markInjectedClaudePtySpawned('window-reconcile-session', 'account-a')
+
+      try {
+        provider.emitExit('window-reconcile-session', 0)
+        await vi.advanceTimersByTimeAsync(50)
+        expect(provider.listProcesses).toHaveBeenCalledTimes(2)
+
+        const newRuntime = {
+          setPtyController: vi.fn(),
+          onPtyExit: vi.fn(),
+          onPtyData: vi.fn()
+        }
+        handlers.clear()
+        registerPtyHandlers(mainWindow as never, newRuntime as never)
+        await vi.advanceTimersByTimeAsync(0)
+        expect(provider.listProcesses).toHaveBeenCalledTimes(3)
+
+        await vi.advanceTimersByTimeAsync(250)
+        expect(provider.listProcesses).toHaveBeenCalledTimes(3)
+        await vi.advanceTimersByTimeAsync(250)
+        expect(provider.listProcesses).toHaveBeenCalledTimes(4)
+
+        provider.listProcesses.mockResolvedValue([])
+        await vi.advanceTimersByTimeAsync(1_000)
+        expect(provider.listProcesses).toHaveBeenCalledTimes(5)
+        expect(oldRuntime.onPtyExit).not.toHaveBeenCalled()
+        expect(newRuntime.onPtyExit).toHaveBeenCalledOnce()
+      } finally {
+        livePtyGate.markClaudePtyExited('window-reconcile-session')
+        vi.useRealTimers()
+      }
+    })
+
+    it('coalesces hanging Claude inventory across repeated window registrations', async () => {
+      let resolveInventory!: (sessions: { id: string; cwd: string; title: string }[]) => void
+      const inventoryPending = new Promise<{ id: string; cwd: string; title: string }[]>(
+        (resolve) => {
+          resolveInventory = resolve
+        }
+      )
+      const provider = installObservableDaemonTestProvider()
+      provider.listProcesses.mockReturnValue(inventoryPending)
+      const oldRuntimes = Array.from({ length: 3 }, () => ({
+        setPtyController: vi.fn(),
+        onPtyExit: vi.fn(),
+        onPtyData: vi.fn()
+      }))
+      handlers.clear()
+      registerPtyHandlers(mainWindow as never, oldRuntimes[0] as never)
+      livePtyGate.markInjectedClaudePtySpawned('hanging-window-session', 'account-a')
+
+      try {
+        provider.emitExit('hanging-window-session', 0)
+        await vi.waitFor(() => expect(provider.listProcesses).toHaveBeenCalledOnce())
+
+        for (const runtime of oldRuntimes.slice(1)) {
+          handlers.clear()
+          registerPtyHandlers(mainWindow as never, runtime as never)
+          await Promise.resolve()
+        }
+        const latestRuntime = {
+          setPtyController: vi.fn(),
+          onPtyExit: vi.fn(),
+          onPtyData: vi.fn()
+        }
+        handlers.clear()
+        registerPtyHandlers(mainWindow as never, latestRuntime as never)
+        await Promise.resolve()
+
+        expect(provider.listProcesses).toHaveBeenCalledOnce()
+        resolveInventory([])
+        await vi.waitFor(() => expect(latestRuntime.onPtyExit).toHaveBeenCalledOnce())
+        expect(oldRuntimes.every((runtime) => runtime.onPtyExit.mock.calls.length === 0)).toBe(true)
+      } finally {
+        livePtyGate.markClaudePtyExited('hanging-window-session')
+      }
+    })
+
+    it('still blocks a non-injected (global-selection) Claude launch while a global account switch is in progress', async () => {
+      const prepareClaudeAuth = vi.fn(async () => ({
+        configDir: '/tmp/claude',
+        envPatch: {},
+        stripAuthEnv: false,
+        provenance: 'managed:account-1'
+      }))
+      // Why: no per-worktree override resolves for this launch, so it must
+      // still go through the global shared-runtime switch-block.
+      const isInjectedClaudeAccountTarget = vi.fn(() => false)
+      registerPtyHandlers(
+        mainWindow as never,
+        undefined,
+        undefined,
+        undefined,
+        prepareClaudeAuth,
+        undefined,
+        undefined,
+        isInjectedClaudeAccountTarget
+      )
+
+      beginClaudeAuthSwitch()
+      try {
+        await expect(
+          handlers.get('pty:spawn')!(null, {
+            cols: 80,
+            rows: 24,
+            command: 'claude'
+          })
+        ).rejects.toThrow('A Claude account switch is in progress. Try again after it finishes.')
+        expect(prepareClaudeAuth).not.toHaveBeenCalled()
+      } finally {
+        endClaudeAuthSwitch()
+      }
+    })
+
+    it('does not treat a global WSL account whose distro is named injected as injected auth', async () => {
+      const prepareClaudeAuth = vi.fn(async () => ({
+        configDir: '/tmp/claude-wsl',
+        runtime: 'wsl' as const,
+        wslDistro: 'injected',
+        envPatch: {},
+        stripAuthEnv: true,
+        provenance: 'managed:account-1:wsl:injected'
+      }))
+      registerPtyHandlers(mainWindow as never, undefined, undefined, undefined, prepareClaudeAuth)
+
+      const spawnResult = (await handlers.get('pty:spawn')!(null, {
+        cols: 80,
+        rows: 24,
+        command: 'claude'
+      })) as { id: string }
+
+      expect(hasLiveClaudePtys()).toBe(true)
+      await handlers.get('pty:kill')!(null, { id: spawnResult.id })
+      expect(hasLiveClaudePtys()).toBe(false)
+    })
+
+    it('never prepares host Claude auth for a pinned SSH worktree launch', async () => {
+      const prepareClaudeAuth = vi.fn()
+      const store = {
+        getWorktreeMeta: vi.fn(() => ({ claudeAccountId: 'host-account' })),
+        upsertSshRemotePtyLease: vi.fn()
+      }
+      registerSshPtyProvider('ssh-1', {
+        spawn: vi.fn(async () => ({ id: 'ssh-claude-session' })),
+        write: vi.fn(),
+        resize: vi.fn(),
+        shutdown: vi.fn(),
+        sendSignal: vi.fn(),
+        getCwd: vi.fn(),
+        getInitialCwd: vi.fn(),
+        clearBuffer: vi.fn(),
+        acknowledgeDataEvent: vi.fn(),
+        hasChildProcesses: vi.fn(),
+        getForegroundProcess: vi.fn(),
+        serialize: vi.fn(),
+        revive: vi.fn(),
+        onData: vi.fn(() => () => {}),
+        onReplay: vi.fn(() => () => {}),
+        onExit: vi.fn(() => () => {}),
+        listProcesses: vi.fn(async () => []),
+        attach: vi.fn(),
+        getDefaultShell: vi.fn(),
+        getProfiles: vi.fn()
+      } as never)
+      registerPtyHandlers(
+        mainWindow as never,
+        undefined,
+        undefined,
+        undefined,
+        prepareClaudeAuth,
+        store as never,
+        undefined,
+        () => true
+      )
+
+      await handlers.get('pty:spawn')!(null, {
+        cols: 80,
+        rows: 24,
+        command: 'claude',
+        connectionId: 'ssh-1',
+        worktreeId: 'ssh-worktree'
+      })
+
+      expect(prepareClaudeAuth).not.toHaveBeenCalled()
     })
 
     it('clears Claude live-PTY tracking from shared provider teardown', () => {
@@ -1411,6 +2335,7 @@ describe('registerPtyHandlers', () => {
           ...args.settings
         }
         return {
+          getWorktreeMeta: vi.fn(),
           getRepo: vi.fn((repoId: string) =>
             repoId === 'repo-1' ? { id: 'repo-1', path: 'C:\\repo' } : undefined
           ),
@@ -2208,6 +3133,7 @@ describe('registerPtyHandlers', () => {
           })
         )
         const store = {
+          getWorktreeMeta: vi.fn(),
           upsertSshRemotePtyLease: vi.fn(),
           persistPtyBinding: vi.fn()
         }
@@ -4755,6 +5681,7 @@ describe('registerPtyHandlers', () => {
       }): Promise<{ id: string }>
     }
     const store = {
+      getWorktreeMeta: vi.fn(),
       persistPtyBinding: vi.fn()
     }
     let controller: RuntimeSpawnController | null = null
@@ -4844,6 +5771,7 @@ describe('registerPtyHandlers', () => {
       getProfiles: vi.fn()
     } as never)
     const store = {
+      getWorktreeMeta: vi.fn(),
       persistPtyBinding: vi.fn()
     }
     let controller: RuntimeSpawnController | null = null
@@ -4959,6 +5887,7 @@ describe('registerPtyHandlers', () => {
       getProfiles: vi.fn()
     } as never)
     const store = {
+      getWorktreeMeta: vi.fn(),
       persistPtyBinding: vi.fn()
     }
     let controller: RuntimeSpawnController | null = null
@@ -5106,6 +6035,7 @@ describe('registerPtyHandlers', () => {
       getProfiles: vi.fn()
     } as never)
     const store = {
+      getWorktreeMeta: vi.fn(),
       persistPtyBinding: vi.fn()
     }
     let controller: RuntimeSpawnController | null = null
@@ -5201,6 +6131,7 @@ describe('registerPtyHandlers', () => {
       getProfiles: vi.fn()
     } as never)
     const store = {
+      getWorktreeMeta: vi.fn(),
       upsertSshRemotePtyLease: vi.fn(),
       persistPtyBinding: vi.fn(),
       removeSshRemotePtyLease: vi.fn(),
@@ -5276,6 +6207,7 @@ describe('registerPtyHandlers', () => {
       }): Promise<{ id: string }>
     }
     const store = {
+      getWorktreeMeta: vi.fn(),
       persistPtyBinding: vi.fn()
     }
     let controller: RuntimeSpawnController | null = null
@@ -5360,6 +6292,7 @@ describe('registerPtyHandlers', () => {
       getProfiles: vi.fn()
     } as never)
     const store = {
+      getWorktreeMeta: vi.fn(),
       upsertSshRemotePtyLease: vi.fn(),
       persistPtyBinding: vi.fn(),
       removeSshRemotePtyLease: vi.fn(),
@@ -5460,6 +6393,7 @@ describe('registerPtyHandlers', () => {
       getProfiles: vi.fn()
     } as never)
     const store = {
+      getWorktreeMeta: vi.fn(),
       upsertSshRemotePtyLease: vi.fn(),
       persistPtyBinding: vi.fn()
     }
@@ -5565,6 +6499,7 @@ describe('registerPtyHandlers', () => {
       getProfiles: vi.fn()
     } as never)
     const store = {
+      getWorktreeMeta: vi.fn(),
       upsertSshRemotePtyLease: vi.fn(),
       persistPtyBinding: vi.fn(() => {
         throw new Error('disk full')
@@ -5661,6 +6596,7 @@ describe('registerPtyHandlers', () => {
       getProfiles: vi.fn()
     } as never)
     const store = {
+      getWorktreeMeta: vi.fn(),
       upsertSshRemotePtyLease: vi.fn(),
       persistPtyBinding: vi.fn(),
       removeSshRemotePtyLease: vi.fn(),
@@ -5769,7 +6705,8 @@ describe('registerPtyHandlers', () => {
       upsertSshRemotePtyLease: vi.fn(),
       persistPtyBinding: vi.fn(),
       removeSshRemotePtyLease: vi.fn(),
-      markSshRemotePtyLease: vi.fn()
+      markSshRemotePtyLease: vi.fn(),
+      getWorktreeMeta: vi.fn()
     }
     let controller: RuntimeSpawnController | null = null
     const runtime = {
@@ -5865,6 +6802,7 @@ describe('registerPtyHandlers', () => {
       getProfiles: vi.fn()
     } as never)
     const store = {
+      getWorktreeMeta: vi.fn(),
       upsertSshRemotePtyLease: vi.fn(),
       persistPtyBinding: vi.fn(() => {
         throw new Error('disk full')

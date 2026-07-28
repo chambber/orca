@@ -7,6 +7,10 @@ import type {
 export type ClaudeAccountSelectionTarget = {
   runtime?: 'host' | 'wsl'
   wslDistro?: string | null
+  /** Per-worktree pinned account id. Valid runtime-compatible pins inject the
+   *  account's own config dir; invalid or mismatched pins fail closed at launch.
+   *  Null/undefined preserves the global selection. */
+  overrideAccountId?: string | null
 }
 
 export type NormalizedClaudeAccountSelectionTarget = {

@@ -120,14 +120,19 @@ import {
   normalizeCodexRuntimeSelection,
   type CodexAccountSelectionTarget
 } from './codex-accounts/runtime-selection'
-import { normalizeClaudeRuntimeSelection } from './claude-accounts/runtime-selection'
+import {
+  getSelectedClaudeAccountIdForTarget,
+  normalizeClaudeRuntimeSelection
+} from './claude-accounts/runtime-selection'
 import { codexHookService } from './codex/hook-service'
 import { getDefaultWslDistro } from './wsl'
 import { ClaudeAccountService } from './claude-accounts/service'
+import { notifyWorktreesChanged } from './ipc/worktree-remote'
 import { ClaudeRuntimeAuthService } from './claude-accounts/runtime-auth-service'
 import {
   attachClaudeLivePtyPersistence,
-  seedLiveClaudePtysFromPersistence
+  seedLiveClaudePtysFromPersistence,
+  seedLiveInjectedClaudePtysFromPersistence
 } from './claude-accounts/live-pty-gate'
 import { StarNagService } from './star-nag/service'
 import { agentHookServer } from './agent-hooks/server'
@@ -951,7 +956,7 @@ function openMainWindow(): BrowserWindow {
     store,
     runtime,
     prepareCodexRuntimeHomeForLaunch,
-    (target) => claudeRuntimeAuth!.prepareForClaudeLaunch(target),
+    (target) => claudeRuntimeAuth!.prepareForClaudeLaunch(target, { reservePtyAccount: true }),
     {
       awaitLocalPtyStartup: () => localPtyStartupReady,
       onBeforeRendererReload: ({ ignoreCache, webContentsId }) => {
@@ -965,7 +970,8 @@ function openMainWindow(): BrowserWindow {
       isRecoveryReloadInFlight,
       onBeforeUpdateQuit: () =>
         preserveAgentAuthBeforeRestart({ codexRuntimeHome, claudeRuntimeAuth, store })
-    }
+    },
+    (target) => claudeRuntimeAuth!.hasInjectedAccountOverride(target)
   )
   rateLimits.attach(window)
   // Why: quota probes can spawn CLIs and hit network. The attached show/focus
@@ -1604,10 +1610,13 @@ app.whenReady().then(async () => {
   // out from under that process (it then shows "Not logged in" mid-session).
   attachClaudeLivePtyPersistence(store)
   const persistedClaudePtyIds = store.getClaudeLivePtySessionIds()
-  seedLiveClaudePtysFromPersistence(persistedClaudePtyIds)
-  if (persistedClaudePtyIds.length > 0) {
+  const persistedSharedClaudePtys = store.getClaudeLiveSharedPtyAccountBindings()
+  seedLiveClaudePtysFromPersistence(persistedClaudePtyIds, persistedSharedClaudePtys)
+  const persistedInjectedClaudePtys = store.getClaudeLivePtyAccountBindings()
+  seedLiveInjectedClaudePtysFromPersistence(persistedInjectedClaudePtys)
+  if (persistedClaudePtyIds.length > 0 || persistedInjectedClaudePtys.length > 0) {
     console.log(
-      `[claude-live-pty] Seeded ${persistedClaudePtyIds.length} persisted Claude session id(s) into the refresh gate`
+      `[claude-live-pty] Seeded ${persistedClaudePtyIds.length} shared and ${persistedInjectedClaudePtys.length} injected Claude session id(s) into the refresh gate`
     )
   }
   selfHealRuntimeEnvironmentFocus({ store, userDataPath: app.getPath('userData') })
@@ -1668,7 +1677,6 @@ app.whenReady().then(async () => {
   codexRuntimeHome = new CodexRuntimeHomeService(store)
   codexAccounts = new CodexAccountService(store, rateLimits, codexRuntimeHome)
   claudeRuntimeAuth = new ClaudeRuntimeAuthService(store)
-  claudeAccounts = new ClaudeAccountService(store, rateLimits, claudeRuntimeAuth)
   rateLimits.setCodexHomePathResolver((target) =>
     codexRuntimeHome!.prepareForRateLimitFetch(target)
   )
@@ -1676,6 +1684,9 @@ app.whenReady().then(async () => {
   rateLimits.setClaudeFetchTarget(getInitialClaudeRateLimitTarget(store.getSettings()))
   rateLimits.setClaudeAuthPreparationResolver((target) =>
     claudeRuntimeAuth!.prepareForRateLimitFetch(target)
+  )
+  rateLimits.setClaudeAccountIdResolver((target) =>
+    getSelectedClaudeAccountIdForTarget(store!.getSettings(), target)
   )
   rateLimits.setOpenCodeGoConfigResolver(() => {
     const settings = store!.getSettings()
@@ -1766,6 +1777,12 @@ app.whenReady().then(async () => {
       isAgentStatusHooksEnabled(store?.getSettings()) ? agentHookServer.buildPtyEnv() : {}
   })
   runtime = runtimeService
+  claudeAccounts = new ClaudeAccountService(store, rateLimits, claudeRuntimeAuth, (repoId) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      notifyWorktreesChanged(mainWindow, repoId)
+    }
+    runtimeService.notifyWorktreesChangedForRemoteClients(repoId)
+  })
   automations = new AutomationService(store, {
     claudeUsage,
     codexUsage,
@@ -2054,8 +2071,9 @@ app.whenReady().then(async () => {
       runtime,
       prepareCodexRuntimeHomeForLaunch,
       () => store!.getSettings(),
-      (target) => claudeRuntimeAuth!.prepareForClaudeLaunch(target),
-      store
+      (target) => claudeRuntimeAuth!.prepareForClaudeLaunch(target, { reservePtyAccount: true }),
+      store,
+      (target) => claudeRuntimeAuth!.hasInjectedAccountOverride(target)
     )
     // Why: headless servers have no renderer to mount <webview> browser panes.
     // Back them with main-process offscreen WebContents instead, so this host can

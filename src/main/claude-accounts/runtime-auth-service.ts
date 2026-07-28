@@ -1,9 +1,10 @@
 /* eslint-disable max-lines -- Why: Claude account switching has one safety
 boundary: runtime auth materialization. Keeping file, Keychain, snapshot, and
 env-patch semantics together prevents PTY launch and quota fetch paths drifting. */
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { promisify } from 'node:util'
 import { app } from 'electron'
 import type { ClaudeManagedAccount } from '../../shared/types'
 import type { Store } from '../persistence'
@@ -15,9 +16,23 @@ import {
   writeClaudeManagedAuthFile
 } from './managed-auth-path'
 import { parseWslUncPath } from '../../shared/wsl-paths'
-import { getDefaultWslDistro, getWslHome, toWindowsWslPath } from '../wsl'
+import {
+  getCachedWslDistros,
+  getDefaultWslDistro,
+  getWslHome,
+  listWslDistrosAsync,
+  toWindowsWslPath
+} from '../wsl'
 import { buildEncodedWslBashCommand } from '../wsl-bash-command'
-import { hasLiveClaudePtys } from './live-pty-gate'
+import {
+  hasLiveClaudePtys,
+  hasLiveInjectedClaudePtysForAccount,
+  hasLiveSharedClaudePtysForAccount,
+  releaseInjectedClaudeAccountLaunch,
+  releaseSharedClaudeAccountLaunch,
+  reserveInjectedClaudeAccountLaunch,
+  reserveSharedClaudeAccountLaunch
+} from './live-pty-gate'
 import { isOauthTokenExpiring, refreshClaudeOauthCredentials } from './oauth-refresh'
 import { ClaudeRuntimePathResolver } from './runtime-paths'
 import {
@@ -30,12 +45,17 @@ import {
   writeManagedClaudeKeychainCredentials
 } from './keychain'
 import {
+  getClaudeWslSelectionKey,
   getSelectedClaudeAccountIdForTarget,
   normalizeClaudeAccountSelectionTarget,
   normalizeClaudeRuntimeSelection,
   setSelectedClaudeAccountIdForTarget,
   type ClaudeAccountSelectionTarget
 } from './runtime-selection'
+
+const execFileAsync = promisify(execFile)
+const OWNED_WSL_AUTH_PATH_SUCCESS_TTL_MS = 30_000
+const OWNED_WSL_AUTH_PATH_FAILURE_TTL_MS = 5_000
 
 export type ClaudeRuntimeAuthPreparation = {
   configDir: string
@@ -45,6 +65,10 @@ export type ClaudeRuntimeAuthPreparation = {
   envPatch: ClaudeEnvPatch
   stripAuthEnv: boolean
   managedRefreshDeferredByLivePty?: boolean
+  injectedAccountId?: string
+  injectedAccountReservationId?: string
+  sharedAccountReservationId?: string
+  sharedAccountId?: string | null
   provenance: string
 }
 
@@ -108,6 +132,15 @@ export class ClaudeRuntimeAuthService {
   private lastWrittenOauthAccount: unknown = null
   private skipNextReadBackForAccountId: string | null = null
   private managedRefreshDeferredByLivePtyAccountId: string | null = null
+  // Windows-only: bounds repeated ownership probes for WSL-pinned accounts.
+  // Successes also expire so external path/marker replacement cannot stay
+  // trusted for the lifetime of the main process.
+  private readonly ownedWslAuthPathCache = new Map<
+    string,
+    { path: string | null; linuxPath: string | null; expiresAt: number }
+  >()
+  private readonly ownedWslAuthPathInflight = new Map<string, Promise<string | null>>()
+  private wslDefaultDistroInflight: Promise<string | null> | null = null
 
   constructor(private readonly store: Store) {
     this.initializeLastSyncedState()
@@ -115,11 +148,64 @@ export class ClaudeRuntimeAuthService {
   }
 
   async prepareForClaudeLaunch(
-    target?: ClaudeAccountSelectionTarget
+    target?: ClaudeAccountSelectionTarget,
+    options?: { reservePtyAccount?: boolean }
   ): Promise<ClaudeRuntimeAuthPreparation> {
-    const effectiveTarget = target ?? this.getDefaultAccountSelectionTarget()
-    await this.syncForCurrentSelection(effectiveTarget)
-    return this.getPreparation(effectiveTarget)
+    const effectiveTarget = await this.resolveWslDefaultTargetForLaunch(
+      target ?? this.getDefaultAccountSelectionTarget()
+    )
+    const settings = this.store.getSettings()
+    const injectedCandidate = this.resolveInjectedAccountCandidate(effectiveTarget, settings)
+    if (injectedCandidate && hasLiveSharedClaudePtysForAccount(injectedCandidate.id)) {
+      // Why: the shared CLI already owns this account's refresh chain. Starting
+      // an isolated pinned copy before it exits would fork the one-use token.
+      throw new Error(
+        'Close the running global Claude terminal before launching this assigned account.'
+      )
+    }
+    const reservationId =
+      injectedCandidate && options?.reservePtyAccount
+        ? reserveInjectedClaudeAccountLaunch(injectedCandidate.id)
+        : undefined
+    const sharedReservationId =
+      !injectedCandidate && !effectiveTarget?.overrideAccountId && options?.reservePtyAccount
+        ? reserveSharedClaudeAccountLaunch(
+            getSelectedClaudeAccountIdForTarget(settings, effectiveTarget)
+          )
+        : undefined
+    try {
+      const injectedAccount = await this.resolveInjectedAccount(effectiveTarget, settings)
+      if (injectedAccount) {
+        // Why: reserve before async ownership/Keychain work so a concurrent
+        // global switch cannot fork this account before the PTY becomes live.
+        await this.seedInjectedHostAccountKeychain(injectedAccount)
+        return this.getInjectedPreparation(injectedAccount, reservationId)
+      }
+      releaseInjectedClaudeAccountLaunch(reservationId)
+    } catch (error) {
+      releaseInjectedClaudeAccountLaunch(reservationId)
+      releaseSharedClaudeAccountLaunch(sharedReservationId)
+      throw error
+    }
+    const overrideAccountId = effectiveTarget?.overrideAccountId
+    if (overrideAccountId) {
+      // Why: an unavailable or incompatible identity pin must fail closed;
+      // silently substituting the global account can cross billing/org boundaries.
+      throw new Error(
+        'The Claude account assigned to this worktree is unavailable for this runtime. Reassign the account before launching Claude.'
+      )
+    }
+    try {
+      await this.syncForCurrentSelection(effectiveTarget)
+      return {
+        ...this.getPreparation(effectiveTarget),
+        sharedAccountReservationId: sharedReservationId,
+        sharedAccountId: getSelectedClaudeAccountIdForTarget(settings, effectiveTarget)
+      }
+    } catch (error) {
+      releaseSharedClaudeAccountLaunch(sharedReservationId)
+      throw error
+    }
   }
 
   async prepareForRateLimitFetch(
@@ -159,6 +245,18 @@ export class ClaudeRuntimeAuthService {
     return this.pathResolver.getRuntimePaths().configDir
   }
 
+  // Synchronous candidate check for the PTY switch gate. Ownership is verified
+  // asynchronously by prepareForClaudeLaunch; a failed candidate then rejects
+  // closed before any shared auth is read or written.
+  hasInjectedAccountOverride(target?: ClaudeAccountSelectionTarget): boolean {
+    const effectiveTarget = target ?? this.getDefaultAccountSelectionTarget()
+    return (
+      this.resolveInjectedAccountCandidate(effectiveTarget, this.store.getSettings(), {
+        allowUnresolvedDefault: true
+      }) !== null
+    )
+  }
+
   private initializeLastSyncedState(): void {
     const settings = this.store.getSettings()
     this.lastSyncedAccountId = getSelectedClaudeAccountIdForTarget(settings, { runtime: 'host' })
@@ -181,6 +279,15 @@ export class ClaudeRuntimeAuthService {
   private async doSyncForCurrentSelection(target?: ClaudeAccountSelectionTarget): Promise<void> {
     const settings = this.store.getSettings()
     const effectiveTarget = this.resolveWslDefaultTarget(target)
+    // Injected (per-worktree pinned) accounts bypass materialization: the
+    // launch injects a per-terminal CLAUDE_CONFIG_DIR (host) or Linux
+    // CLAUDE_CONFIG_DIR (WSL) instead of mutating shared ~/.claude or the
+    // global switch-block/selection. Mirrors the WSL early-return below.
+    // warnOnMismatch: true makes this the single point per sync cycle that
+    // logs a runtime-incompatible override before falling back to global.
+    if (await this.resolveInjectedAccount(effectiveTarget, settings, { warnOnMismatch: true })) {
+      return
+    }
     const normalizedTarget = normalizeClaudeAccountSelectionTarget(effectiveTarget)
     const activeAccountId = getSelectedClaudeAccountIdForTarget(settings, normalizedTarget)
     const activeAccount = this.getActiveAccount(settings.claudeManagedAccounts, activeAccountId)
@@ -188,14 +295,32 @@ export class ClaudeRuntimeAuthService {
       settings.claudeManagedAccounts,
       this.lastSyncedAccountId
     )
+    // Why: Windows WSL ownership checks use an async subprocess now; populate
+    // the short-lived cache before the existing synchronous credential readers.
+    await Promise.all(
+      [activeAccount, previousAccount]
+        .filter((account): account is ClaudeManagedAccount => account?.managedAuthRuntime === 'wsl')
+        .map((account) => this.ensureOwnedManagedAuthPath(account))
+    )
     this.managedRefreshDeferredByLivePtyAccountId = null
+    if (activeAccount && hasLiveInjectedClaudePtysForAccount(activeAccount.id)) {
+      // Why: a pinned CLI owns this account's single-use refresh chain. Copying
+      // or reconciling it into shared auth would fork that chain mid-session.
+      throw new Error(
+        'This Claude account is in use by an assigned worktree. Close that Claude terminal before selecting or refreshing the account globally.'
+      )
+    }
     const previousManagedCredentialsJson = previousAccount
       ? await this.readManagedCredentials(previousAccount)
       : null
     const previousManagedOauthAccount = previousAccount
       ? this.readManagedOauthAccount(previousAccount)
       : null
-    if (previousAccount && previousAccount.id !== activeAccount?.id) {
+    if (
+      previousAccount &&
+      previousAccount.id !== activeAccount?.id &&
+      !hasLiveInjectedClaudePtysForAccount(previousAccount.id)
+    ) {
       if (previousManagedCredentialsJson) {
         const outgoingReadBackResult = await this.readBackRefreshedTokens(
           previousManagedCredentialsJson,
@@ -329,6 +454,11 @@ export class ClaudeRuntimeAuthService {
     }
 
     let credentialsJson = await this.readManagedCredentials(activeAccount)
+    const scopedReconciliation = await this.adoptFresherInjectedScopedCredentials(
+      activeAccount,
+      credentialsJson
+    )
+    credentialsJson = scopedReconciliation.credentialsJson
     if (!credentialsJson || !this.isValidCredentialsJsonObject(credentialsJson)) {
       console.warn(
         '[claude-runtime-auth] Active managed account is missing or has invalid credentials, restoring system default'
@@ -441,6 +571,11 @@ export class ClaudeRuntimeAuthService {
         credentialsJson = refreshed
       }
     }
+    await this.repairExistingInjectedScopedCredentials(
+      activeAccount,
+      credentialsJson,
+      scopedReconciliation.existingScopedCredentialsJson
+    )
 
     const paths = this.pathResolver.getRuntimePaths()
     this.writeRuntimeCredentials(credentialsJson)
@@ -709,6 +844,36 @@ export class ClaudeRuntimeAuthService {
     }
   }
 
+  private getInjectedPreparation(
+    account: ClaudeManagedAccount,
+    reservationId?: string
+  ): ClaudeRuntimeAuthPreparation {
+    if (account.managedAuthRuntime === 'wsl' && account.wslLinuxAuthPath) {
+      return {
+        configDir: account.managedAuthPath,
+        runtime: 'wsl',
+        wslDistro: account.wslDistro ?? null,
+        wslLinuxConfigDir: account.wslLinuxAuthPath,
+        envPatch: { CLAUDE_CONFIG_DIR: account.wslLinuxAuthPath },
+        stripAuthEnv: true,
+        injectedAccountId: account.id,
+        injectedAccountReservationId: reservationId,
+        provenance: `managed:${account.id}:wsl:injected:${account.wslDistro ?? ''}`
+      }
+    }
+    return {
+      configDir: account.managedAuthPath,
+      runtime: 'host',
+      wslDistro: null,
+      wslLinuxConfigDir: null,
+      envPatch: { CLAUDE_CONFIG_DIR: account.managedAuthPath },
+      stripAuthEnv: true,
+      injectedAccountId: account.id,
+      injectedAccountReservationId: reservationId,
+      provenance: `managed:${account.id}:injected`
+    }
+  }
+
   private getActiveAccount(
     accounts: ClaudeManagedAccount[],
     activeAccountId: string | null
@@ -717,6 +882,250 @@ export class ClaudeRuntimeAuthService {
       return null
     }
     return accounts.find((account) => account.id === activeAccountId) ?? null
+  }
+
+  // Resolves a per-worktree pinned account into the account to inject, or null
+  // to fall back to the global selection. A host worktree only honors a host
+  // override; a WSL worktree only honors a WSL override whose distro matches
+  // the launch (or the default distro when the target has none). On a runtime/
+  // distro mismatch, returns no candidate. prepareForClaudeLaunch rejects any
+  // stale or incompatible pin before shared auth can substitute another account.
+  private resolveInjectedAccountCandidate(
+    target: ClaudeAccountSelectionTarget | undefined,
+    settings = this.store.getSettings(),
+    options: { warnOnMismatch?: boolean; allowUnresolvedDefault?: boolean } = {}
+  ): ClaudeManagedAccount | null {
+    const overrideAccountId = target?.overrideAccountId
+    if (!overrideAccountId) {
+      return null
+    }
+    const account = this.getActiveAccount(settings.claudeManagedAccounts, overrideAccountId)
+    if (!account) {
+      return null
+    }
+    const normalizedTarget = normalizeClaudeAccountSelectionTarget(target)
+    const accountIsWsl = account.managedAuthRuntime === 'wsl'
+    // Callers resolve a distro-less WSL target to the concrete default distro
+    // (resolveWslDefaultTarget), so an account stored as the default WSL account
+    // (wslDistro: null -> '__default__') must still match a launch whose distro
+    // resolved to that same concrete default. The synchronous PTY predicate uses
+    // only the cached default; async launch preparation fills that cache first.
+    const cachedDefaultDistro = getCachedWslDistros()?.[0] ?? null
+    const defaultWslKey = getClaudeWslSelectionKey(cachedDefaultDistro)
+    const canonicalizeWslKey = (key: string): string =>
+      key === '__default__' ? defaultWslKey : key
+    // Legacy default-WSL records may omit wslDistro even though their owned UNC
+    // path carries the concrete distro; prefer that stable identity when present.
+    const accountWslKey = getClaudeWslSelectionKey(
+      account.wslDistro ?? parseWslUncPath(account.managedAuthPath)?.distro
+    )
+    const targetWslKey = getClaudeWslSelectionKey(normalizedTarget.wslDistro)
+    const needsUnresolvedDefault =
+      !cachedDefaultDistro &&
+      accountWslKey !== targetWslKey &&
+      (accountWslKey === '__default__' || targetWslKey === '__default__')
+    const wslDistroMatches = needsUnresolvedDefault
+      ? Boolean(options.allowUnresolvedDefault)
+      : canonicalizeWslKey(accountWslKey) === canonicalizeWslKey(targetWslKey)
+    const runtimeMismatch =
+      (normalizedTarget.runtime === 'host' && accountIsWsl) ||
+      (normalizedTarget.runtime === 'wsl' && (!accountIsWsl || !wslDistroMatches))
+    if (runtimeMismatch) {
+      if (options.warnOnMismatch) {
+        console.warn(
+          `[claude-runtime-auth] Worktree-pinned Claude account ${account.id} runtime (${
+            accountIsWsl ? `wsl:${account.wslDistro ?? 'default'}` : 'host'
+          }) does not match the launch runtime (${
+            normalizedTarget.runtime === 'wsl'
+              ? `wsl:${normalizedTarget.wslDistro ?? 'default'}`
+              : 'host'
+          }); falling back to global account selection`
+        )
+      }
+      return null
+    }
+    return account
+  }
+
+  private async resolveInjectedAccount(
+    target: ClaudeAccountSelectionTarget | undefined,
+    settings = this.store.getSettings(),
+    options: { warnOnMismatch?: boolean; allowUnresolvedDefault?: boolean } = {}
+  ): Promise<ClaudeManagedAccount | null> {
+    const account = this.resolveInjectedAccountCandidate(target, settings, options)
+    if (!account) {
+      return null
+    }
+    if (account.managedAuthRuntime === 'wsl' && !account.wslLinuxAuthPath) {
+      return null
+    }
+    const ownedPath = account.managedAuthPath
+      ? await this.ensureOwnedManagedAuthPath(account)
+      : null
+    if (!ownedPath) {
+      return null
+    }
+    if (account.managedAuthRuntime !== 'wsl') {
+      return account
+    }
+    const cacheKey = `${account.id}:${account.managedAuthPath}`
+    const cachedCanonicalLinuxPath = this.ownedWslAuthPathCache.get(cacheKey)?.linuxPath ?? null
+    const canonicalWslPath = parseWslUncPath(ownedPath)
+    const canonicalLinuxPath = cachedCanonicalLinuxPath ?? canonicalWslPath?.linuxPath ?? null
+    if (!canonicalLinuxPath) {
+      return account
+    }
+    // Why: ownership verification canonicalizes the Linux path. Inject exactly
+    // that verified path instead of trusting the independently persisted copy.
+    return {
+      ...account,
+      managedAuthPath: ownedPath,
+      wslDistro: canonicalWslPath?.distro ?? account.wslDistro,
+      wslLinuxAuthPath: canonicalLinuxPath
+    }
+  }
+
+  // macOS only: Claude Code 2.1+ reads Keychain credentials from a config-dir-
+  // scoped service (`Claude Code-credentials-<sha256(configDir)[:8]>`), not
+  // the legacy unscoped service. An injected per-worktree host account points
+  // CLAUDE_CONFIG_DIR at its own managedAuthPath, so before launch we seed
+  // ONLY that scoped service from the account's managed credentials — never
+  // the legacy unscoped service, which is the shared global-selection
+  // singleton and would race across worktrees pinned to different accounts.
+  // Runs once per prepareForClaudeLaunch() call (one seed per PTY spawn).
+  // Seeds only on first launch: if the scoped service already holds valid
+  // creds, Claude owns them (possibly rotated) and we leave them untouched.
+  // Best-effort: a write failure just falls back to Claude's own login prompt
+  // for that one terminal instead of blocking the launch. No-op on
+  // Linux/Windows, where keychain ops are already no-ops and the file in the
+  // managed dir is authoritative.
+  private async seedInjectedHostAccountKeychain(account: ClaudeManagedAccount): Promise<void> {
+    if (process.platform !== 'darwin') {
+      return
+    }
+    // WSL accounts are isolated by their own Linux CLAUDE_CONFIG_DIR and need
+    // no Keychain seed (see WSL comment on doSyncForCurrentSelection above).
+    if (account.managedAuthRuntime === 'wsl') {
+      return
+    }
+    try {
+      // Only bootstrap the scoped service on first launch. The seed source is
+      // the managed keychain (keyed by account.id), but once Claude runs with
+      // CLAUDE_CONFIG_DIR=managedAuthPath it owns the scoped service (keyed by
+      // sha256(managedAuthPath)) and may rotate/refresh the tokens there.
+      // Injected accounts are CLI-owned (no read-back), so the managed copy is
+      // never updated to match — re-seeding it would clobber a fresher refresh
+      // token and break auth. The scoped service for this per-account config
+      // dir only ever holds this account's creds, so if valid creds already
+      // exist there, leave Claude's copy in place.
+      const existingScopedCredentials = await this.readActiveClaudeKeychainCredentialsBestEffort(
+        account.managedAuthPath
+      )
+      const credentialsJson = await this.readManagedCredentials(account)
+      if (!credentialsJson || !this.isValidCredentialsJsonObject(credentialsJson)) {
+        return
+      }
+      if (
+        existingScopedCredentials &&
+        this.isValidCredentialsJsonObject(existingScopedCredentials)
+      ) {
+        if (this.runtimeCredentialsAreFresher(credentialsJson, existingScopedCredentials)) {
+          // Why: re-auth updates managed storage; repair an older scoped copy
+          // so the pinned CLI does not keep using a revoked refresh token.
+          await writeActiveClaudeKeychainCredentials(credentialsJson, account.managedAuthPath)
+        } else if (
+          this.credentialsCandidateIsFresherOrRotated(existingScopedCredentials, credentialsJson)
+        ) {
+          // Why: the pinned CLI owns this account-specific service and may
+          // rotate tokens there; preserve that rotation for later global use.
+          await this.writeManagedCredentials(account, existingScopedCredentials)
+        }
+        return
+      }
+      await writeActiveClaudeKeychainCredentials(credentialsJson, account.managedAuthPath)
+    } catch (error) {
+      console.warn(
+        '[claude-runtime-auth] Failed to seed scoped Keychain credentials for injected account:',
+        error
+      )
+    }
+  }
+
+  private async adoptFresherInjectedScopedCredentials(
+    account: ClaudeManagedAccount,
+    managedCredentialsJson: string | null
+  ): Promise<{
+    credentialsJson: string | null
+    existingScopedCredentialsJson: string | null
+  }> {
+    if (
+      process.platform !== 'darwin' ||
+      account.managedAuthRuntime === 'wsl' ||
+      !managedCredentialsJson
+    ) {
+      return { credentialsJson: managedCredentialsJson, existingScopedCredentialsJson: null }
+    }
+    try {
+      const scopedCredentialsJson = await readActiveClaudeKeychainCredentialsStrict(
+        account.managedAuthPath
+      )
+      if (
+        !scopedCredentialsJson ||
+        !this.isValidCredentialsJsonObject(scopedCredentialsJson) ||
+        !this.credentialsCandidateIsFresherOrRotated(scopedCredentialsJson, managedCredentialsJson)
+      ) {
+        return {
+          credentialsJson: managedCredentialsJson,
+          existingScopedCredentialsJson: scopedCredentialsJson
+        }
+      }
+      // Why: the scoped service belongs only to this managed config dir, so a
+      // fresher token can be attributed without consulting shared runtime auth.
+      await this.writeManagedCredentials(account, scopedCredentialsJson)
+      return {
+        credentialsJson: scopedCredentialsJson,
+        existingScopedCredentialsJson: scopedCredentialsJson
+      }
+    } catch (error) {
+      console.warn(
+        '[claude-runtime-auth] Failed to reconcile injected scoped Keychain credentials:',
+        error
+      )
+      return { credentialsJson: managedCredentialsJson, existingScopedCredentialsJson: null }
+    }
+  }
+
+  private async repairExistingInjectedScopedCredentials(
+    account: ClaudeManagedAccount,
+    managedCredentialsJson: string,
+    existingScopedCredentialsJson: string | null
+  ): Promise<void> {
+    if (
+      process.platform !== 'darwin' ||
+      account.managedAuthRuntime === 'wsl' ||
+      !existingScopedCredentialsJson
+    ) {
+      return
+    }
+    try {
+      if (
+        this.isValidCredentialsJsonObject(existingScopedCredentialsJson) &&
+        !this.credentialsCandidateIsFresherOrRotated(
+          managedCredentialsJson,
+          existingScopedCredentialsJson
+        )
+      ) {
+        return
+      }
+      // Why: global refresh/re-auth must keep a previously-pinned CLI on the
+      // same single-use token chain, but must not create a new scoped copy.
+      await writeActiveClaudeKeychainCredentials(managedCredentialsJson, account.managedAuthPath)
+    } catch (error) {
+      console.warn(
+        '[claude-runtime-auth] Failed to repair existing injected scoped Keychain credentials:',
+        error
+      )
+    }
   }
 
   private getDefaultAccountSelectionTarget(
@@ -737,7 +1146,31 @@ export class ClaudeRuntimeAuthService {
       return target ?? { runtime: 'host' }
     }
     const defaultDistro = getDefaultWslDistro()
-    return defaultDistro ? { runtime: 'wsl', wslDistro: defaultDistro } : target
+    // Preserve other target fields (notably overrideAccountId) when filling in
+    // the concrete default distro — otherwise a distro-less WSL launch would
+    // drop its per-worktree account pin and fall back to global selection.
+    return defaultDistro ? { ...target, runtime: 'wsl', wslDistro: defaultDistro } : target
+  }
+
+  private async resolveWslDefaultTargetForLaunch(
+    target?: ClaudeAccountSelectionTarget
+  ): Promise<ClaudeAccountSelectionTarget> {
+    if (target?.runtime !== 'wsl' || target.wslDistro?.trim()) {
+      return target ?? { runtime: 'host' }
+    }
+    const lookup =
+      this.wslDefaultDistroInflight ??
+      listWslDistrosAsync().then(([defaultDistro]) => defaultDistro ?? null)
+    this.wslDefaultDistroInflight = lookup
+    let defaultDistro: string | null
+    try {
+      defaultDistro = await lookup
+    } finally {
+      if (this.wslDefaultDistroInflight === lookup) {
+        this.wslDefaultDistroInflight = null
+      }
+    }
+    return defaultDistro ? { ...target, runtime: 'wsl', wslDistro: defaultDistro } : target
   }
 
   private async findManagedAccountForRuntimeCredentials(
@@ -940,6 +1373,18 @@ export class ClaudeRuntimeAuthService {
     )
   }
 
+  private credentialsCandidateIsFresherOrRotated(
+    candidateCredentialsJson: string,
+    baselineCredentialsJson: string
+  ): boolean {
+    return (
+      this.runtimeCredentialsAreFresher(candidateCredentialsJson, baselineCredentialsJson) ||
+      (this.compareRefreshTokens(candidateCredentialsJson, baselineCredentialsJson) ===
+        'different' &&
+        !this.runtimeCredentialsAreOlder(candidateCredentialsJson, baselineCredentialsJson))
+    )
+  }
+
   private chooseFreshestReadBackCandidate(
     candidates: {
       credentialsJson: string
@@ -1127,40 +1572,88 @@ export class ClaudeRuntimeAuthService {
         return null
       }
       if (process.platform === 'win32') {
-        try {
-          const canonicalLinuxPath = execFileSync(
-            'wsl.exe',
-            [
-              '-d',
-              wslInfo.distro,
-              '--',
-              'bash',
-              '-lc',
-              buildEncodedWslBashCommand(
-                [
-                  'set -euo pipefail',
-                  `candidate=${shellQuote(wslInfo.linuxPath)}`,
-                  'managed_root="${HOME%/}/.local/share/orca/claude-accounts"',
-                  'candidate_real=$(readlink -f -- "$candidate")',
-                  'managed_root_real=$(readlink -f -- "$managed_root")',
-                  'test -f "$candidate_real/.orca-managed-claude-auth"',
-                  `test "$(cat "$candidate_real/.orca-managed-claude-auth")" = ${shellQuote(account.id)}`,
-                  'case "$candidate_real" in "$managed_root_real"/*/auth) printf "%s\\n" "$candidate_real" ;; *) exit 35 ;; esac'
-                ].join('\n')
-              )
-            ],
-            { encoding: 'utf-8', timeout: 5000 }
-          ).trim()
-          return canonicalLinuxPath ? toWindowsWslPath(canonicalLinuxPath, wslInfo.distro) : null
-        } catch {
-          return null
+        const cacheKey = `${account.id}:${account.managedAuthPath}`
+        const cached = this.ownedWslAuthPathCache.get(cacheKey)
+        if (cached && cached.expiresAt > Date.now()) {
+          return cached.path
         }
+        return null
       }
       return existsSync(account.managedAuthPath) ? account.managedAuthPath : null
     }
     return resolveOwnedClaudeManagedAuthPath(account.id, account.managedAuthPath, {
       adoptLegacyMarker: true
     })
+  }
+
+  private async ensureOwnedManagedAuthPath(account: ClaudeManagedAccount): Promise<string | null> {
+    const cachedOrLocalPath = this.getOwnedManagedAuthPath(account)
+    if (cachedOrLocalPath) {
+      return cachedOrLocalPath
+    }
+    const wslInfo = parseWslUncPath(account.managedAuthPath)
+    if (!wslInfo || process.platform !== 'win32') {
+      return null
+    }
+    const cacheKey = `${account.id}:${account.managedAuthPath}`
+    const cached = this.ownedWslAuthPathCache.get(cacheKey)
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.path
+    }
+    const inflight = this.ownedWslAuthPathInflight.get(cacheKey)
+    if (inflight) {
+      return inflight
+    }
+    const probe = (async (): Promise<string | null> => {
+      try {
+        const { stdout } = await execFileAsync(
+          'wsl.exe',
+          [
+            '-d',
+            wslInfo.distro,
+            '--',
+            'bash',
+            '-lc',
+            buildEncodedWslBashCommand(
+              [
+                'set -euo pipefail',
+                `candidate=${shellQuote(wslInfo.linuxPath)}`,
+                'managed_root="${HOME%/}/.local/share/orca/claude-accounts"',
+                'candidate_real=$(readlink -f -- "$candidate")',
+                'managed_root_real=$(readlink -f -- "$managed_root")',
+                'test -f "$candidate_real/.orca-managed-claude-auth"',
+                `test "$(cat "$candidate_real/.orca-managed-claude-auth")" = ${shellQuote(account.id)}`,
+                'case "$candidate_real" in "$managed_root_real"/*/auth) printf "%s\\n" "$candidate_real" ;; *) exit 35 ;; esac'
+              ].join('\n')
+            )
+          ],
+          { encoding: 'utf-8', timeout: 5000 }
+        )
+        const canonicalLinuxPath = String(stdout).trim()
+        const resolved = canonicalLinuxPath
+          ? toWindowsWslPath(canonicalLinuxPath, wslInfo.distro)
+          : null
+        this.ownedWslAuthPathCache.set(cacheKey, {
+          path: resolved,
+          linuxPath: resolved ? canonicalLinuxPath : null,
+          expiresAt:
+            Date.now() +
+            (resolved ? OWNED_WSL_AUTH_PATH_SUCCESS_TTL_MS : OWNED_WSL_AUTH_PATH_FAILURE_TTL_MS)
+        })
+        return resolved
+      } catch {
+        this.ownedWslAuthPathCache.set(cacheKey, {
+          path: null,
+          linuxPath: null,
+          expiresAt: Date.now() + OWNED_WSL_AUTH_PATH_FAILURE_TTL_MS
+        })
+        return null
+      }
+    })().finally(() => {
+      this.ownedWslAuthPathInflight.delete(cacheKey)
+    })
+    this.ownedWslAuthPathInflight.set(cacheKey, probe)
+    return probe
   }
 
   private async captureSystemDefaultSnapshotForManagedEntry(

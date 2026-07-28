@@ -1168,6 +1168,9 @@ export type PreloadApi = {
       expectedHead: string
     }) => Promise<ForceDeleteWorktreeBranchResult>
     updateMeta: (args: { worktreeId: string; updates: Partial<WorktreeMeta> }) => Promise<Worktree>
+    updateMetaBatch: (args: {
+      updates: { worktreeId: string; updates: Partial<WorktreeMeta> }[]
+    }) => Promise<void>
     listLineage: () => Promise<{
       lineage: Record<string, WorktreeLineage>
       workspaceLineage?: Record<string, WorkspaceLineage>

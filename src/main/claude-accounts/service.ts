@@ -29,7 +29,13 @@ import {
   writeActiveClaudeKeychainCredentials,
   writeManagedClaudeKeychainCredentials
 } from './keychain'
-import { beginClaudeAuthSwitch, endClaudeAuthSwitch } from './live-pty-gate'
+import {
+  beginClaudeAuthSwitch,
+  endClaudeAuthSwitch,
+  hasLiveInjectedClaudePtysForAccount,
+  hasLiveSharedClaudePtysForAccount,
+  runManagedClaudeAccountMutation
+} from './live-pty-gate'
 import { parseWslUncPath } from '../../shared/wsl-paths'
 import { toWindowsWslPath } from '../wsl'
 import { buildEncodedWslBashCommand } from '../wsl-bash-command'
@@ -43,6 +49,7 @@ import {
   setSelectedClaudeAccountIdForTarget,
   type ClaudeAccountSelectionTarget
 } from './runtime-selection'
+import { getRepoIdFromWorktreeId } from '../../shared/worktree-id'
 
 const LOGIN_TIMEOUT_MS = 180_000
 const STATUS_TIMEOUT_MS = 20_000
@@ -91,7 +98,8 @@ export class ClaudeAccountService {
   constructor(
     private readonly store: Store,
     private readonly rateLimits: RateLimitService,
-    private readonly runtimeAuth: ClaudeRuntimeAuthService
+    private readonly runtimeAuth: ClaudeRuntimeAuthService,
+    private readonly onWorktreeAccountPinsChanged?: (repoId: string) => void
   ) {}
 
   listAccounts(): ClaudeRateLimitAccountsState {
@@ -104,22 +112,34 @@ export class ClaudeAccountService {
   }
 
   async reauthenticateAccount(accountId: string): Promise<ClaudeRateLimitAccountsState> {
-    return this.serializeMutation(() => this.doReauthenticateAccount(accountId))
+    return this.serializeMutation(() =>
+      this.withManagedAccountMutation(accountId, () => this.doReauthenticateAccount(accountId))
+    )
   }
 
   async removeAccount(accountId: string): Promise<ClaudeRateLimitAccountsState> {
-    return this.serializeMutation(() => this.doRemoveAccount(accountId))
+    return this.serializeMutation(() =>
+      this.withManagedAccountMutation(accountId, () => this.doRemoveAccount(accountId))
+    )
   }
 
   async selectAccount(accountId: string | null): Promise<ClaudeRateLimitAccountsState> {
-    return this.serializeMutation(() => this.doSelectAccount(accountId))
+    return this.serializeMutation(() =>
+      accountId
+        ? this.withManagedAccountMutation(accountId, () => this.doSelectAccount(accountId))
+        : this.doSelectAccount(accountId)
+    )
   }
 
   async selectAccountForTarget(
     accountId: string | null,
     target?: ClaudeAccountSelectionTarget
   ): Promise<ClaudeRateLimitAccountsState> {
-    return this.serializeMutation(() => this.doSelectAccount(accountId, target))
+    return this.serializeMutation(() =>
+      accountId
+        ? this.withManagedAccountMutation(accountId, () => this.doSelectAccount(accountId, target))
+        : this.doSelectAccount(accountId, target)
+    )
   }
 
   cancelPendingLogin(): boolean {
@@ -130,6 +150,13 @@ export class ClaudeAccountService {
     const next = this.mutationQueue.then(fn, fn)
     this.mutationQueue = next.catch(() => {})
     return next
+  }
+
+  private async withManagedAccountMutation<T>(
+    accountId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    return runManagedClaudeAccountMutation(accountId, operation)
   }
 
   private async doAddAccount(
@@ -181,6 +208,7 @@ export class ClaudeAccountService {
   }
 
   private async doReauthenticateAccount(accountId: string): Promise<ClaudeRateLimitAccountsState> {
+    this.assertAccountAuthIsIdle(accountId)
     const account = this.requireAccount(accountId)
     const managedAuthPath = this.assertManagedAuthPath(account.managedAuthPath, accountId)
     const previousSettings = this.store.getSettings()
@@ -261,6 +289,7 @@ export class ClaudeAccountService {
   }
 
   private async doRemoveAccount(accountId: string): Promise<ClaudeRateLimitAccountsState> {
+    this.assertAccountAuthIsIdle(accountId)
     const account = this.requireAccount(accountId)
     const settings = this.store.getSettings()
     const nextAccounts = settings.claudeManagedAccounts.filter((entry) => entry.id !== accountId)
@@ -270,6 +299,14 @@ export class ClaudeAccountService {
     )
     const nextActiveId =
       settings.activeClaudeManagedAccountId === accountId ? null : nextSelection.host
+    const previousManagedAuth = await this.readManagedAuthSnapshot(
+      accountId,
+      account.managedAuthPath
+    )
+    let restoredPins: Record<string, string | null> = {}
+    let removalCommitted = false
+    let credentialRemovalStarted = false
+    let affectedRepoIds: string[] = []
 
     try {
       if (
@@ -283,16 +320,26 @@ export class ClaudeAccountService {
           activeClaudeManagedAccountIdsByRuntime: nextSelection
         })
         await this.syncRuntimeAuthWithLivePtyGate(getClaudeSelectionTargetForAccount(account))
-        this.store.updateSettings({ claudeManagedAccounts: nextAccounts })
       } else {
-        this.store.updateSettings({
+        await this.syncRuntimeAuthWithLivePtyGate(getClaudeSelectionTargetForAccount(account))
+      }
+      // Why: worktree creation can finish while account removal awaits auth sync.
+      // Snapshot pins at the durable commit boundary so none can escape cleanup.
+      const pinnedWorktreeIds = Object.entries(this.store.getAllWorktreeMeta())
+        .filter(([, meta]) => meta.claudeAccountId === accountId)
+        .map(([worktreeId]) => worktreeId)
+      affectedRepoIds = [...new Set(pinnedWorktreeIds.map(getRepoIdFromWorktreeId))]
+      const clearedPins = Object.fromEntries(pinnedWorktreeIds.map((id) => [id, null]))
+      restoredPins = Object.fromEntries(pinnedWorktreeIds.map((id) => [id, accountId]))
+      this.commitClaudeAccountState(
+        {
           claudeManagedAccounts: nextAccounts,
           activeClaudeManagedAccountId: nextActiveId,
           activeClaudeManagedAccountIdsByRuntime: nextSelection
-        })
-        await this.syncRuntimeAuthWithLivePtyGate(getClaudeSelectionTargetForAccount(account))
-      }
-      await this.safeRemoveManagedAuth(accountId, account.managedAuthPath)
+        },
+        clearedPins
+      )
+      removalCommitted = true
       this.rateLimits.evictInactiveClaudeCache(accountId)
       await this.rateLimits.refreshForClaudeAccountChange(
         getSelectedClaudeAccountIdForTarget(
@@ -303,9 +350,43 @@ export class ClaudeAccountService {
           : undefined,
         getClaudeSelectionTargetForAccount(account)
       )
+      credentialRemovalStarted = true
+      await this.safeRemoveManagedAuth(accountId, account.managedAuthPath, { strict: true })
+      for (const repoId of affectedRepoIds) {
+        try {
+          this.onWorktreeAccountPinsChanged?.(repoId)
+        } catch (error) {
+          // Why: renderer invalidation is best-effort after the durable removal;
+          // an event delivery failure must not resurrect deleted credentials.
+          console.warn('[claude-accounts] Failed to notify cleared worktree pins:', error)
+        }
+      }
       return this.getSnapshot()
     } catch (error) {
-      this.restoreClaudeSettings(settings)
+      if (credentialRemovalStarted) {
+        try {
+          await this.restoreManagedAuthAfterRemoval(account, previousManagedAuth)
+        } catch (rollbackError) {
+          // Why: never resurrect an account record when its credential rollback
+          // failed; the durable removed state remains the safer side of the split.
+          throw new AggregateError(
+            [error, rollbackError],
+            'Claude account removal failed and its credentials could not be restored.'
+          )
+        }
+      }
+      if (removalCommitted) {
+        this.commitClaudeAccountState(
+          {
+            claudeManagedAccounts: settings.claudeManagedAccounts,
+            activeClaudeManagedAccountId: settings.activeClaudeManagedAccountId,
+            activeClaudeManagedAccountIdsByRuntime: settings.activeClaudeManagedAccountIdsByRuntime
+          },
+          restoredPins
+        )
+      } else {
+        this.restoreClaudeSettings(settings)
+      }
       await this.runtimeAuth.forceMaterializeCurrentSelectionForRollback()
       throw error
     }
@@ -317,6 +398,7 @@ export class ClaudeAccountService {
   ): Promise<ClaudeRateLimitAccountsState> {
     let effectiveTarget = target
     if (accountId !== null) {
+      this.assertAccountAuthIsIdle(accountId)
       const account = this.requireAccount(accountId)
       const accountTarget = getClaudeSelectionTargetForAccount(account)
       const requestedTarget = normalizeClaudeAccountSelectionTarget(target ?? accountTarget)
@@ -333,21 +415,32 @@ export class ClaudeAccountService {
     const previousSettings = this.store.getSettings()
     const selection = normalizeClaudeRuntimeSelection(previousSettings)
     const outgoingAccountId = getSelectedClaudeAccountIdForTarget(previousSettings, effectiveTarget)
-    const nextSelection = setSelectedClaudeAccountIdForTarget(selection, accountId, effectiveTarget)
-    this.store.updateSettings({
-      activeClaudeManagedAccountId:
-        effectiveTarget?.runtime === 'wsl' ? nextSelection.host : accountId,
-      activeClaudeManagedAccountIdsByRuntime: nextSelection
-    })
-    try {
-      await this.syncRuntimeAuthWithLivePtyGate(effectiveTarget)
-      await this.rateLimits.refreshForClaudeAccountChange(outgoingAccountId, effectiveTarget)
-      return this.getSnapshot()
-    } catch (error) {
-      this.restoreClaudeSettings(previousSettings)
-      await this.runtimeAuth.forceMaterializeCurrentSelectionForRollback()
-      throw error
+    const applySelection = async (): Promise<ClaudeRateLimitAccountsState> => {
+      const nextSelection = setSelectedClaudeAccountIdForTarget(
+        selection,
+        accountId,
+        effectiveTarget
+      )
+      this.store.updateSettings({
+        activeClaudeManagedAccountId:
+          effectiveTarget?.runtime === 'wsl' ? nextSelection.host : accountId,
+        activeClaudeManagedAccountIdsByRuntime: nextSelection
+      })
+      try {
+        await this.syncRuntimeAuthWithLivePtyGate(effectiveTarget)
+        await this.rateLimits.refreshForClaudeAccountChange(outgoingAccountId, effectiveTarget)
+        return this.getSnapshot()
+      } catch (error) {
+        this.restoreClaudeSettings(previousSettings)
+        await this.runtimeAuth.forceMaterializeCurrentSelectionForRollback()
+        throw error
+      }
     }
+    // Why: runtime sync can read back and rewrite the account being switched
+    // away from, so pinned launches must exclude that account for the full switch.
+    return outgoingAccountId
+      ? runManagedClaudeAccountMutation(outgoingAccountId, applySelection, true)
+      : applySelection()
   }
 
   private getSnapshot(): ClaudeRateLimitAccountsState {
@@ -366,7 +459,7 @@ export class ClaudeAccountService {
       id: account.id,
       email: account.email,
       managedAuthRuntime: account.managedAuthRuntime ?? 'host',
-      wslDistro: account.wslDistro ?? null,
+      wslDistro: account.wslDistro ?? parseWslUncPath(account.managedAuthPath)?.distro ?? null,
       authMethod: account.authMethod ?? 'unknown',
       organizationUuid: account.organizationUuid ?? null,
       organizationName: account.organizationName ?? null,
@@ -384,6 +477,20 @@ export class ClaudeAccountService {
       throw new Error('That Claude account no longer exists.')
     }
     return account
+  }
+
+  private assertAccountAuthIsIdle(accountId: string): void {
+    if (
+      !hasLiveInjectedClaudePtysForAccount(accountId) &&
+      !hasLiveSharedClaudePtysForAccount(accountId)
+    ) {
+      return
+    }
+    // Why: any live CLI owns this account's refresh chain; reauth, selecting
+    // the same account again, or removal would invalidate that process.
+    throw new Error(
+      'This Claude account is in use by an assigned worktree. Close its Claude terminal before changing the account.'
+    )
   }
 
   private normalizeActiveSelection(): void {
@@ -409,6 +516,13 @@ export class ClaudeAccountService {
       activeClaudeManagedAccountId: settings.activeClaudeManagedAccountId,
       activeClaudeManagedAccountIdsByRuntime: settings.activeClaudeManagedAccountIdsByRuntime
     })
+  }
+
+  private commitClaudeAccountState(
+    settingsUpdates: Parameters<Store['commitClaudeAccountState']>[0],
+    worktreeAccountIds: Parameters<Store['commitClaudeAccountState']>[1]
+  ): void {
+    this.store.commitClaudeAccountState(settingsUpdates, worktreeAccountIds)
   }
 
   private async syncRuntimeAuthWithLivePtyGate(
@@ -708,6 +822,20 @@ export class ClaudeAccountService {
     }
   }
 
+  private async restoreManagedAuthAfterRemoval(
+    account: ClaudeManagedAccount,
+    snapshot: ManagedClaudeAuthSnapshot
+  ): Promise<void> {
+    mkdirSync(account.managedAuthPath, { recursive: true })
+    writeFileSync(
+      join(account.managedAuthPath, '.orca-managed-claude-auth'),
+      `${account.id}\n`,
+      'utf-8'
+    )
+    await this.restoreManagedCredentialsSnapshot(account.id, account.managedAuthPath, snapshot)
+    this.restoreManagedOauthSnapshot(account.id, account.managedAuthPath, snapshot)
+  }
+
   private restoreManagedOauthSnapshot(
     accountId: string,
     managedAuthPath: string,
@@ -872,12 +1000,24 @@ export class ClaudeAccountService {
     return parts.length === 2 && parts[1] === 'auth' ? parts[0] : null
   }
 
-  private async safeRemoveManagedAuth(accountId: string, candidatePath: string): Promise<void> {
+  private async safeRemoveManagedAuth(
+    accountId: string,
+    candidatePath: string,
+    options?: { strict?: boolean }
+  ): Promise<void> {
     try {
       const managedAuthPath = this.assertManagedAuthPath(candidatePath, accountId)
+      if (process.platform === 'darwin') {
+        // Why: injected launches create a config-dir-scoped credential item;
+        // removing only Orca's managed item would leave usable auth orphaned.
+        await deleteActiveClaudeKeychainCredentialsStrict(managedAuthPath)
+      }
       rmSync(resolve(managedAuthPath, '..'), { recursive: true, force: true })
     } catch (error) {
       console.warn('[claude-accounts] Refusing to remove untrusted managed auth:', error)
+      if (options?.strict) {
+        throw error
+      }
     }
     await deleteManagedClaudeKeychainCredentials(accountId)
   }

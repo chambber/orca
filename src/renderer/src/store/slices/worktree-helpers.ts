@@ -22,6 +22,7 @@ import type {
 } from '../../../../shared/types'
 import type { WorktreeForceDeleteReason } from '../../../../shared/worktree-removal'
 import type { TerminalGitHubPRLink } from '../../../../shared/terminal-github-pr-link-detector'
+import type { ExecutionHostId } from '../../../../shared/execution-host'
 import type {
   PendingWorktreeCreation,
   WorktreeCreationPhase
@@ -115,7 +116,10 @@ export type WorktreeSlice = {
    */
   hasHydratedWorktreePurge: boolean
   fetchDetectedWorktrees: (repoId: string) => Promise<DetectedWorktreeListResult | null>
-  fetchWorktrees: (repoId: string, options?: { requireAuthoritative?: boolean }) => Promise<boolean>
+  fetchWorktrees: (
+    repoId: string,
+    options?: { requireAuthoritative?: boolean; executionHostId?: ExecutionHostId }
+  ) => Promise<boolean>
   fetchAllWorktrees: (options?: { hydrationPurge?: 'allow' | 'defer' }) => Promise<void>
   fetchWorktreeLineage: () => Promise<void>
   updateWorktreeLineage: (
@@ -154,9 +158,14 @@ export type WorktreeSlice = {
     linkedAzureDevOpsPR?: number | null,
     linkedGiteaPR?: number | null,
     compareBaseRef?: string,
-    // Why: reserved for automation-dispatch flows so host-side provenance can
-    // be minted securely; regular create callers should omit this.
-    options?: { automationProvenanceRequest?: CreateWorktreeArgs['automationProvenanceRequest'] }
+    options?: {
+      // Why: reserved for automation-dispatch flows so host-side provenance can
+      // be minted securely; regular create callers should omit this.
+      automationProvenanceRequest?: CreateWorktreeArgs['automationProvenanceRequest']
+      /** Claude managed account to pin the new worktree to. Omitted/null =
+       *  inherit the global host selection. */
+      claudeAccountId?: CreateWorktreeArgs['claudeAccountId']
+    }
   ) => Promise<CreateWorktreeResult>
   /** Register an in-flight background creation and make it the active surface. */
   beginPendingWorktreeCreation: (entry: PendingWorktreeCreation) => void

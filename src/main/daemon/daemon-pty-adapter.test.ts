@@ -138,6 +138,49 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
       expect(result.id).toContain('wt-1')
     })
 
+    it('keeps a required reattach atomic when the daemon session is gone', async () => {
+      await expect(
+        adapter.spawn({
+          cols: 80,
+          rows: 24,
+          sessionId: 'missing-shared-session',
+          requireReattach: true
+        })
+      ).rejects.toThrow('missing-shared-session')
+
+      expect(lastSpawnOpts).toBeNull()
+    })
+
+    it('fails closed when a legacy daemon cannot enforce required reattach', async () => {
+      const legacy = new DaemonPtyAdapter({ socketPath, tokenPath, protocolVersion: 21 })
+      vi.spyOn(legacy, 'listProcesses').mockResolvedValue([
+        { id: 'legacy-shared-session', cwd: '', title: '' }
+      ])
+
+      await expect(
+        legacy.spawn({
+          cols: 80,
+          rows: 24,
+          sessionId: 'legacy-shared-session',
+          requireReattach: true
+        })
+      ).rejects.toThrow('cannot be safely reattached')
+    })
+
+    it('lets routing continue when a legacy daemon proves the session is absent', async () => {
+      const legacy = new DaemonPtyAdapter({ socketPath, tokenPath, protocolVersion: 21 })
+      vi.spyOn(legacy, 'listProcesses').mockResolvedValue([])
+
+      await expect(
+        legacy.spawn({
+          cols: 80,
+          rows: 24,
+          sessionId: 'missing-legacy-shared-session',
+          requireReattach: true
+        })
+      ).rejects.toThrow('PTY_REQUIRED_REATTACH_UNAVAILABLE')
+    })
+
     itOnPosix('keeps plain Codex startup on the short daemon shell-ready timeout', async () => {
       await adapter.spawn({
         cols: 80,
